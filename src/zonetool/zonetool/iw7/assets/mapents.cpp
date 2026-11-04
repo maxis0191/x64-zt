@@ -863,25 +863,25 @@ namespace zonetool::iw7
 		if (data->dynEntClientList[0][0])
 		{
 			buf->align(3);
-			buf->write(data->dynEntClientList[0][0], data->dynEntCount[0]);
+			buf->write(data->dynEntClientList[0][0], std::max<unsigned short>(data->dynEntCount[0], 1)); // the client walks entry 0 even for an empty list
 			buf->clear_pointer(&dest->dynEntClientList[0][0]);
 		}
 		if (data->dynEntClientList[1][0])
 		{
 			buf->align(3);
-			buf->write(data->dynEntClientList[1][0], data->dynEntCount[0]);
+			buf->write(data->dynEntClientList[1][0], std::max<unsigned short>(data->dynEntCount[0], 1)); // the client walks entry 0 even for an empty list
 			buf->clear_pointer(&dest->dynEntClientList[1][0]);
 		}
 		if (data->dynEntClientList[0][1])
 		{
 			buf->align(3);
-			buf->write(data->dynEntClientList[0][1], data->dynEntCount[1]);
+			buf->write(data->dynEntClientList[0][1], std::max<unsigned short>(data->dynEntCount[1], 1)); // the client walks entry 0 even for an empty list
 			buf->clear_pointer(&dest->dynEntClientList[0][1]);
 		}
 		if (data->dynEntClientList[1][1])
 		{
 			buf->align(3);
-			buf->write(data->dynEntClientList[1][1], data->dynEntCount[1]);
+			buf->write(data->dynEntClientList[1][1], std::max<unsigned short>(data->dynEntCount[1], 1)); // the client walks entry 0 even for an empty list
 			buf->clear_pointer(&dest->dynEntClientList[1][1]);
 		}
 		buf->pop_stream();
@@ -1036,20 +1036,21 @@ namespace zonetool::iw7
 				buf->clear_pointer(&dest->scriptableMapEnts.runtimeData.partRuntimeLocalClient[1]);
 			}
 
-			if (data->scriptableMapEnts.reservedDynents[0].reservedDynents)
-			{
-				buf->align(3);
-				buf->write(data->scriptableMapEnts.reservedDynents[0].reservedDynents, data->scriptableMapEnts.reservedDynents[0].numReservedDynents);
-				buf->clear_pointer(&dest->scriptableMapEnts.reservedDynents[0].reservedDynents);
-			}
-			if (data->scriptableMapEnts.reservedDynents[1].reservedDynents)
-			{
-				buf->align(3);
-				buf->write(data->scriptableMapEnts.reservedDynents[1].reservedDynents, data->scriptableMapEnts.reservedDynents[1].numReservedDynents);
-				buf->clear_pointer(&dest->scriptableMapEnts.reservedDynents[1].reservedDynents);
-			}
-
 			buf->clear_pointer(&dest->scriptableMapEnts.instances);
+		}
+
+		// the reservations exist without map scriptable instances (runtime scriptables use them)
+		if (data->scriptableMapEnts.reservedDynents[0].reservedDynents)
+		{
+			buf->align(3);
+			buf->write(data->scriptableMapEnts.reservedDynents[0].reservedDynents, data->scriptableMapEnts.reservedDynents[0].numReservedDynents);
+			buf->clear_pointer(&dest->scriptableMapEnts.reservedDynents[0].reservedDynents);
+		}
+		if (data->scriptableMapEnts.reservedDynents[1].reservedDynents)
+		{
+			buf->align(3);
+			buf->write(data->scriptableMapEnts.reservedDynents[1].reservedDynents, data->scriptableMapEnts.reservedDynents[1].numReservedDynents);
+			buf->clear_pointer(&dest->scriptableMapEnts.reservedDynents[1].reservedDynents);
 		}
 
 		if (data->mayhemScenes)

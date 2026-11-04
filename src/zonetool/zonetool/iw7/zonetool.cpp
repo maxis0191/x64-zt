@@ -207,6 +207,7 @@ namespace zonetool::iw7
 			DUMP_ASSET(ASSET_TYPE_RETICLE, reticle, ReticleDef);
 			DUMP_ASSET(ASSET_TYPE_RUMBLE, rumble, RumbleInfo);
 			DUMP_ASSET(ASSET_TYPE_RUMBLE_GRAPH, rumble_graph, RumbleGraph);
+			DUMP_ASSET(ASSET_TYPE_BEHAVIOR_TREE, behavior_tree, BehaviorTree);
 			DUMP_ASSET(ASSET_TYPE_SCRIPTABLE, scriptable_def, ScriptableDef);
 			DUMP_ASSET(ASSET_TYPE_SCRIPTFILE, scriptfile, ScriptFile);
 			DUMP_ASSET(ASSET_TYPE_STREAMING_INFO, streaming_info, StreamingInfo);
@@ -1256,6 +1257,20 @@ namespace zonetool::iw7
 					{
 						verify_zone(args[i + 1]);
 						i++;
+
+						do_exit = true;
+					}
+					else if (args[i] == "-dumpzonetypes" && i + 2 < args.size())
+					{
+						// -dumpzonetypes <zone> <type,type,...>: dump only the listed asset types
+						asset_type_filter.clear();
+						for (const auto& type_str : utils::string::split(args[i + 2], ','))
+						{
+							const auto type = type_to_int(type_str);
+							if (type != -1) asset_type_filter.insert(static_cast<XAssetType>(type));
+						}
+						dump_zone(args[i + 1], game::iw7);
+						i += 2;
 
 						do_exit = true;
 					}
