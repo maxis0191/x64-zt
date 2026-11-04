@@ -2,6 +2,7 @@
 #include "zonetool.hpp"
 
 #include "converter/converter.hpp"
+#include "iwzmap/iwzmap.hpp"
 
 #include "../utils/gsc.hpp"
 #include "../utils/csv_generator.hpp"
@@ -386,9 +387,43 @@ namespace zonetool::iw7
 		zonetool::taskbar::clear();
 	}
 
+	namespace
+	{
+		std::mutex captured_shader_mutex;
+		std::unordered_map<std::string, std::string> captured_shaders[ASSET_TYPE_COUNT];
+
+		template <typename T>
+		void capture_shader(XAssetType type, T* shader)
+		{
+			if (!shader || !shader->name) return;
+			const auto& def = shader->prog.loadDef;
+			if (!def.program || def.programSize < 4 || std::memcmp(def.program, "DXBC", 4)) return;
+			std::lock_guard _(captured_shader_mutex);
+			captured_shaders[type].try_emplace(shader->name, reinterpret_cast<const char*>(def.program), def.programSize);
+		}
+	}
+
+	const std::string* find_captured_shader(XAssetType type, const std::string& name)
+	{
+		std::lock_guard _(captured_shader_mutex);
+		const auto it = captured_shaders[type].find(name);
+		return it == captured_shaders[type].end() ? nullptr : &it->second;
+	}
+
 	utils::hook::detour db_add_xasset_hook;
 	XAssetHeader db_add_xasset_stub(XAssetType type, XAssetHeader* header)
 	{
+		// keep shader bytecode: the engine drops it once the D3D object exists, and shaders are
+		// deduplicated into shared techset zones, so a new zone may need bytes it has no dump of
+		switch (type)
+		{
+		case ASSET_TYPE_PIXELSHADER: capture_shader(type, header->pixelShader); break;
+		case ASSET_TYPE_VERTEXSHADER: capture_shader(type, header->vertexShader); break;
+		case ASSET_TYPE_HULLSHADER: capture_shader(type, header->hullShader); break;
+		case ASSET_TYPE_DOMAINSHADER: capture_shader(type, header->domainShader); break;
+		default: break;
+		}
+
 		XAsset xasset =
 		{
 			type,
@@ -985,6 +1020,17 @@ namespace zonetool::iw7
 			std::quick_exit(EXIT_SUCCESS);
 		});
 
+		::iw7::command::add("iwzcompile", [](const ::iw7::command::params& params)
+		{
+			if (params.size() < 5)
+			{
+				ZONETOOL_ERROR("usage: iwzcompile <template zone> <template map> <new map> <source dir>");
+				return;
+			}
+
+			iwzmap::compile(params.get(1), params.get(2), params.get(3), params.get(4));
+		});
+
 		::iw7::command::add("buildzone", [](const ::iw7::command::params& params)
 		{
 			if (params.size() != 2)
@@ -1165,6 +1211,13 @@ namespace zonetool::iw7
 					{
 						load_zone(args[i + 1]);
 						i++;
+
+						do_exit = true;
+					}
+					else if (args[i] == "-iwzcompile" && i + 4 < args.size())
+					{
+						iwzmap::compile(args[i + 1], args[i + 2], args[i + 3], args[i + 4]);
+						i += 4;
 
 						do_exit = true;
 					}

@@ -84,6 +84,7 @@ namespace zonetool::iw7
 
 	XAssetHeader db_find_x_asset_header(XAssetType type, const char* name, int create_default);
 	XAssetHeader db_find_x_asset_header_safe(XAssetType type, const std::string& name);
+	const std::string* find_captured_shader(XAssetType type, const std::string& name);
 
 	template <typename T>
 	XAssetHeader db_find_x_asset_header_copy(XAssetType type, const std::string& name, zone_memory* mem)
