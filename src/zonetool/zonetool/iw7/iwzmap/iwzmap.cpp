@@ -325,8 +325,9 @@ namespace zonetool::iw7::iwzmap
 			tz->vertexCount = static_cast<unsigned int>(src.vertices.size());
 			tz->vd.vertices = mem->allocate<GfxWorldVertex>(src.vertices.size());
 			std::memcpy(tz->vd.vertices, src.vertices.data(), src.vertices.size() * sizeof(GfxWorldVertex));
-			tz->vertexLayerDataSize = 0;
-			tz->vld.data = nullptr;
+			// a non-empty (zeroed) vertex layer stream: the renderer creates a buffer from it
+			tz->vertexLayerDataSize = static_cast<unsigned int>(src.vertices.size() * 16);
+			tz->vld.data = mem->allocate<unsigned char>(tz->vertexLayerDataSize);
 			tz->cellCount = 1;
 			tz->aabbTreeCounts = mem->allocate<GfxCellTreeCount>(1);
 			tz->aabbTreeCounts[0].aabbTreeCount = 1;
@@ -357,14 +358,27 @@ namespace zonetool::iw7::iwzmap
 			std::memcpy(c->havokWorldShapeData, hkx.data(), hkx.size());
 			c->numCollisionHeatmapEntries = 0;
 			c->collisionHeatmap = nullptr;
-			for (auto i = 0; i < c->stageCount; i++)
-			{
-				c->stages[i].name = mem->duplicate_string(c->stages[i].name ? c->stages[i].name : "");
-			}
+			// stages index the template triggers, which are removed
+			c->stageCount = 0;
+			c->stages = nullptr;
+			std::memset(&c->stageTrigger, 0, sizeof(c->stageTrigger));
 		}
 
-		void build_ents(MapEnts* e, const std::string& bsp, const std::string& ents, zone_memory* mem)
+		void build_ents(MapEnts* e, const std::string& bsp, const std::string& ents, const world_source& src, zone_memory* mem)
 		{
+			// one sub-model (the world, *0) to match the single GfxWorld brush model
+			if (e->numSubModels > 1)
+			{
+				e->numSubModels = 1;
+			}
+			if (e->numSubModels == 1 && e->cmodels)
+			{
+				e->cmodels[0].bounds = make_bounds(src.mins, src.maxs);
+				e->cmodels[0].radius = std::sqrt(e->cmodels[0].bounds.halfSize[0] * e->cmodels[0].bounds.halfSize[0] +
+					e->cmodels[0].bounds.halfSize[1] * e->cmodels[0].bounds.halfSize[1] +
+					e->cmodels[0].bounds.halfSize[2] * e->cmodels[0].bounds.halfSize[2]);
+			}
+
 			e->name = mem->duplicate_string(bsp);
 			e->numEntityChars = static_cast<int>(ents.size() + 1);
 			e->entityString = mem->allocate<char>(ents.size() + 1);
@@ -372,6 +386,8 @@ namespace zonetool::iw7::iwzmap
 
 			// nothing of the template may appear in the new world: clear each list with its pointers,
 			// so that the writer and the engine loader agree on an empty list
+			// no template triggers: they pull a physics asset that also lives in the stock zone
+			std::memset(&e->trigger, 0, sizeof(e->trigger));
 			std::memset(&e->clientTrigger, 0, sizeof(e->clientTrigger));
 			std::memset(&e->clientTriggerBlend, 0, sizeof(e->clientTriggerBlend));
 			std::memset(&e->spawnList, 0, sizeof(e->spawnList));
@@ -461,7 +477,7 @@ namespace zonetool::iw7::iwzmap
 
 			build_gfx(w, tz, src, map, bsp, mem.get());
 			build_clip(c, bsp, hkx, mem.get());
-			build_ents(e, bsp, ents, mem.get());
+			build_ents(e, bsp, ents, src, mem.get());
 			build_nav(n, bsp, graph, mem.get());
 
 			cw->name = mem->duplicate_string(bsp);
