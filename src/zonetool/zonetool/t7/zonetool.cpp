@@ -23,6 +23,26 @@ namespace zonetool::t7
 
 	std::unordered_set<std::pair<std::uint32_t, std::string>, pair_hash<std::uint32_t, std::string>> ignore_assets;
 
+	// Optional record of every registered asset: type index, type name, asset name and the
+	// header address the database keeps. Lets external read-only tools resolve references.
+	std::FILE* asset_log = nullptr;
+	std::mutex asset_log_mutex;
+	std::atomic_bool zone_finished{ false };
+
+	void log_asset_address(const XAssetType type, const XAssetHeader header)
+	{
+		if (!asset_log || !header.data)
+		{
+			return;
+		}
+
+		XAsset asset{ type, header };
+		const auto* name = DB_GetXAssetName(&asset);
+		std::lock_guard _(asset_log_mutex);
+		std::fprintf(asset_log, "%d\t%s\t%s\t%p\n", static_cast<int>(type), g_assetNames[type],
+			name ? name : "", header.data);
+	}
+
 	const char* get_asset_name(XAssetType type, void* pointer)
 	{
 		XAssetHeader header{ .data = pointer };
@@ -361,10 +381,13 @@ namespace zonetool::t7
 
 		if (type == ASSET_TYPE_IMAGE)
 		{
+			log_asset_address(type, header);
 			return header;
 		}
 
-		return db_add_xasset_hook.invoke<XAssetHeader>(type, header);
+		const auto result = db_add_xasset_hook.invoke<XAssetHeader>(type, header);
+		log_asset_address(type, result);
+		return result;
 	}
 
 	utils::hook::detour db_finish_load_x_file_hook;
@@ -374,6 +397,7 @@ namespace zonetool::t7
 		if (ff_name == filesystem::get_fastfile())
 		{
 			stop_dumping();
+			zone_finished = true;
 		}
 		
 		return db_finish_load_x_file_hook.invoke<void>(a1, a2);
@@ -536,6 +560,9 @@ namespace zonetool::t7
 		}
 
 		wait_for_database();
+
+		// stop_dumping ends verification when this fastfile finishes loading
+		filesystem::set_fastfile(name);
 
 		globals.verify = true;
 		if (!load_zone(name, false, true))
@@ -761,7 +788,79 @@ namespace zonetool::t7
 						dump_zone(args[i + 1], game::t7);
 						i++;
 					}
+					else if (args[i] == "-assetlog")
+					{
+						asset_log = std::fopen(args[i + 1].data(), "wb");
+						if (!asset_log)
+						{
+							ZONETOOL_FATAL("Could not open asset log \"%s\"", args[i + 1].data());
+						}
+						i++;
+					}
+					else if (args[i] == "-dumpzoneto" && i + 3 < args.size())
+					{
+						// -dumpzoneto <target game> <zone> <asset filter|_>
+						const auto target = game::get_mode_from_string(args[i + 1]);
+						if (target == game::none || !dump_functions.contains(target))
+						{
+							ZONETOOL_FATAL("Unsupported dump target \"%s\"", args[i + 1].data());
+						}
+
+						asset_type_filter.clear();
+						if (args[i + 3] != "_")
+						{
+							for (const auto& type_str : utils::string::split(args[i + 3], ','))
+							{
+								const auto type = type_to_int(type_str);
+								if (type < 0)
+								{
+									ZONETOOL_FATAL("Invalid asset type \"%s\"", type_str.data());
+								}
+								asset_type_filter.insert(static_cast<XAssetType>(type));
+							}
+						}
+
+						dump_zone(args[i + 2], target);
+						asset_type_filter.clear();
+						i += 3;
+					}
+					else if (args[i] == "-holdzone" && i + 2 < args.size())
+					{
+						// -holdzone <zone> <release file>: load the zone, then keep the process
+						// alive with the zone resident until the release file exists.
+						const auto& zone = args[i + 1];
+						const auto& release = args[i + 2];
+						wait_for_database();
+						filesystem::set_fastfile(zone);
+						zone_finished = false;
+						if (load_zone(zone, false, true))
+						{
+							while (!zone_finished)
+							{
+								Sleep(5);
+							}
+						}
+
+						if (asset_log)
+						{
+							std::fflush(asset_log);
+						}
+
+						ZONETOOL_INFO("ZONETOOL_HOLD %s %lu", zone.data(), GetCurrentProcessId());
+						std::fflush(stdout);
+						while (!utils::io::file_exists(release))
+						{
+							Sleep(100);
+						}
+						i += 2;
+					}
 				}
+			}
+
+			if (asset_log)
+			{
+				std::fclose(asset_log);
+				asset_log = nullptr;
 			}
 
 			std::quick_exit(EXIT_SUCCESS);

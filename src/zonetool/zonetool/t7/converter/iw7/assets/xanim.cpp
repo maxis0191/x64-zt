@@ -77,15 +77,30 @@ namespace zonetool::t7
 					short* newRandom = new_asset->randomDataShort;
 					short* data = asset->dataShort;
 					short* random = asset->randomDataShort;
+					short* const data_end = new_asset->dataShort + new_asset->dataShortCount;
+					short* const random_end = new_asset->randomDataShort + new_asset->randomDataShortCount;
 
-					auto readConvert = [](short*& dst, short*& src, uint32_t count)
+					// Every write stays inside the arrays sized by the source counts; a
+					// channel layout that does not fit is refused instead of overrunning.
+					const auto check = [&](short* dst, short* end, uint32_t count)
 					{
+						if (dst + count > end)
+						{
+							throw std::runtime_error(utils::string::va("xanim \"%s\": short channel data exceeds its count",
+								asset->name));
+						}
+					};
+
+					auto readConvert = [&](short*& dst, short*& src, uint32_t count, short* end)
+					{
+						check(dst, end, count);
 						for (uint32_t i = 0; i < count; ++i)
 							*dst++ = QuatInt16::ToInt16(half_float::half_to_float(*src++));
 					};
 
-					auto readRaw = [](short*& dst, short*& src, uint32_t count = 1)
+					auto readRaw = [&](short*& dst, short*& src, uint32_t count = 1)
 					{
+						check(dst, data_end, count);
 						for (uint32_t i = 0; i < count; ++i)
 							*dst++ = *src++;
 					};
@@ -96,14 +111,17 @@ namespace zonetool::t7
 					{
 						for (int i = 0; i < asset->boneCount[boneCountIndex]; ++i)
 						{
+							check(newData, data_end, 1);
 							const uint16_t frameCount = *data;
 							readRaw(newData, data); // Frame count
 
+							// Animations longer than 255 frames keep their key frame indices
+							// inline as shorts: one per key frame (frameCount + 1).
 							if (frameSize == 2)
-								readRaw(newData, data); // Frame index
+								readRaw(newData, data, frameCount + 1u); // Frame indices
 
 							for (int f = 0; f < frameCount + 1; ++f)
-								readConvert(newRandom, random, rotSize); // Rotation data
+								readConvert(newRandom, random, rotSize, random_end); // Rotation data
 						}
 					};
 
@@ -113,7 +131,7 @@ namespace zonetool::t7
 					auto processStaticBoneData = [&](int boneCountIndex, int rotSize)
 					{
 						for (int i = 0; i < asset->boneCount[boneCountIndex]; ++i)
-							readConvert(newData, data, rotSize); // Static rotation data
+							readConvert(newData, data, rotSize, data_end); // Static rotation data
 					};
 
 					processStaticBoneData(TwoDStaticRotatedBoneCount, 2);
@@ -137,10 +155,46 @@ namespace zonetool::t7
 				return new_asset;
 			}
 
+			bool has_resident_data(const XAnimParts* asset)
+			{
+				// Streamed BO3 animations keep their channel data in an xpak; the
+				// resident header then has counts without data pointers.
+				const auto missing = [](const std::uint32_t count, const void* data)
+				{
+					return count != 0 && data == nullptr;
+				};
+
+				return !(missing(asset->dataByteCount, asset->dataByte) ||
+					missing(asset->dataShortCount, asset->dataShort) ||
+					missing(asset->dataIntCount, asset->dataInt) ||
+					missing(asset->randomDataByteCount, asset->randomDataByte) ||
+					missing(asset->randomDataShortCount, asset->randomDataShort) ||
+					missing(asset->randomDataIntCount, asset->randomDataInt) ||
+					missing(asset->indexCount, asset->indices.data) ||
+					missing(asset->boneCount[TotalBoneCount], asset->names) ||
+					missing(asset->notifyCount, asset->notify));
+			}
+
 			void dump(XAnimParts* asset)
 			{
+				if (!has_resident_data(asset))
+				{
+					ZONETOOL_ERROR("xanim \"%s\" has no resident data (streamed size %u), not converted",
+						asset->name, asset->streamedFileSize);
+					return;
+				}
+
 				utils::memory::allocator allocator;
-				const auto converted_asset = convert(asset, allocator);
+				zonetool::iw7::XAnimParts* converted_asset = nullptr;
+				try
+				{
+					converted_asset = convert(asset, allocator);
+				}
+				catch (const std::exception& e)
+				{
+					ZONETOOL_ERROR("%s, not converted", e.what());
+					return;
+				}
 				zonetool::iw7::xanim_parts::dump(converted_asset);
 			}
 		}
