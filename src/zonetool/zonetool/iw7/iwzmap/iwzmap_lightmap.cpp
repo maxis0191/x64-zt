@@ -140,10 +140,17 @@ namespace zonetool::iw7::iwzmap
 		}
 
 		// lightmap reindex data: the template describes its 4096 x 4096 secondary as 2048 x 2048 tiles (packed size
-		// 4096 x 4096, imagePixelSize 8). Scale every rectangle to the baked atlas so the description stays
-		// consistent with the images (IWZ_LM_TEMPLATE_REINDEX keeps the template values for comparison).
+		// 4096 x 4096, imagePixelSize 8). Engine-tested default (run iwz-stage2/lightmaps/run_cal): template reindex
+		// rectangles kept, packed size = atlas W x H. IWZ_LM_SCALE_REINDEX scales every rectangle to the atlas instead
+		// (not engine-tested yet).
 		const double tpl_w = (r.packedLightmap && r.packedLightmapCount) ? r.packedLightmap[0].imageWidth : 0.0;
-		if (!std::getenv("IWZ_LM_TEMPLATE_REINDEX") && r.packedLightmap && r.packedLightmapCount && tpl_w > 0)
+		if (!std::getenv("IWZ_LM_SCALE_REINDEX") && r.packedLightmap && r.packedLightmapCount)
+		{
+			auto* packed = mem->allocate<GfxWorldPackedLightmap>(r.packedLightmapCount);
+			for (auto i = 0u; i < r.packedLightmapCount; i++) { packed[i].imageWidth = width; packed[i].imageHeight = height; }
+			w->draw.lightmapReindexData.packedLightmap = packed;
+		}
+		else if (r.packedLightmap && r.packedLightmapCount && tpl_w > 0)
 		{
 			const auto sx = width / tpl_w;
 			const auto sy = (height * 2.0) / r.packedLightmap[0].imageHeight;
