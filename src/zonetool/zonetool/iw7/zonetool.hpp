@@ -32,6 +32,7 @@
 #include "assets/rumble.hpp"
 #include "assets/rumble_graph.hpp"
 #include "assets/behavior_tree.hpp"
+#include "assets/animclass.hpp"
 #include "assets/scriptabledef.hpp"
 #include "assets/scriptfile.hpp"
 #include "assets/streaming_info.hpp"

@@ -576,8 +576,9 @@ namespace zonetool::iw7::iwzmap
 			add_triggers(e, triggers, ents, mem);
 			ZONETOOL_INFO("template triggers: %u models %u hulls %u slabs %u windings; client %u models", e->trigger.count,
 				e->trigger.hullCount, e->trigger.slabCount, e->trigger.windingCount, e->clientTrigger.trigger.count);
-			for (auto i : {0u, 4u, 20u, 21u, 22u, 145u})
+			for (auto i = 0u; i < e->trigger.count; i++)
 			{
+				if (!std::getenv("IWZ_LIST_TRIGGERS") && i != 21) continue;
 				if (i >= e->trigger.count) continue;
 				const auto& tm = e->trigger.models[i];
 				const auto& hb = e->trigger.hulls[tm.firstHull].bounds;
