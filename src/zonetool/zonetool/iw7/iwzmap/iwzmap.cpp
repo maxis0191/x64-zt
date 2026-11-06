@@ -720,11 +720,11 @@ namespace zonetool::iw7::iwzmap
 					xmodel parser;
 					zone_memory scratch(64ull * 1024 * 1024);
 					const auto* m = parser.parse(dinst.model->name, &scratch);
-					std::string lods;
+					std::string lod_list;
 					auto surfs = 0;
-					if (m) for (auto l = 0; l < m->numLods; l++) { lods += std::to_string(m->lodInfo[l].numsurfs) + "@" + std::to_string(static_cast<int>(m->lodInfo[l].dist)) + " "; surfs += m->lodInfo[l].numsurfs; }
+					if (m) for (auto l = 0; l < m->numLods; l++) { lod_list += std::to_string(m->lodInfo[l].numsurfs) + "@" + std::to_string(static_cast<int>(m->lodInfo[l].dist)) + " "; surfs += m->lodInfo[l].numsurfs; }
 					ZONETOOL_INFO("rel: model %s numLods %d numsurfs %d lods [%s] sum %d | unk2 %u unk3 %u unk11 %u lod %u flags %04x cull %u", dinst.model->name,
-						m ? m->numLods : -1, m ? m->numsurfs : -1, lods.data(), surfs, dinst.unk2, dinst.unk3, dinst.unk11, d.lodData[i], dinst.flags, dinst.cullDist);
+						m ? m->numLods : -1, m ? m->numsurfs : -1, lod_list.data(), surfs, dinst.unk2, dinst.unk3, dinst.unk11, d.lodData[i], dinst.flags, dinst.cullDist);
 					scratch.free();
 				}
 			}
