@@ -17,6 +17,15 @@ namespace zonetool::iw7
 		this->script_strings.push_back(std::pair<scr_string_t*, const char*>(ptr, str));
 	}
 
+	void map_ents::set_script_string(scr_string_t* ptr, const char* str)
+	{
+		for (auto& entry : this->script_strings)
+		{
+			if (entry.first == ptr) { entry.second = str; return; }
+		}
+		this->script_strings.emplace_back(ptr, str);
+	}
+
 	const char* map_ents::get_script_string(scr_string_t* ptr)
 	{
 		for (std::uint32_t i = 0; i < this->script_strings.size(); i++)
@@ -30,6 +39,20 @@ namespace zonetool::iw7
 	}
 
 	std::string extra_entity_strings;
+
+	map_ents* map_ents::dump_string_source = nullptr;
+
+	namespace
+	{
+		const char* dump_script_string(scr_string_t* ptr)
+		{
+			if (map_ents::dump_string_source)
+			{
+				if (const auto* s = map_ents::dump_string_source->get_script_string(ptr)) return s;
+			}
+			return SL_ConvertToString(*ptr);
+		}
+	}
 
 	void map_ents::add_entity_string(const std::string& line)
 	{
@@ -1347,9 +1370,9 @@ namespace zonetool::iw7
 			dumper.dump_asset(asset->scriptableMapEnts.instances[i].contextHeaderLocalClient[1].context.modelData.model);
 			dumper.dump_array(asset->scriptableMapEnts.instances[i].contextHeaderLocalClient[1].context.eventStreamBuffer, asset->scriptableMapEnts.instances[i].contextHeaderLocalClient[1].context.eventStreamBufferSize);
 
-			dumper.dump_string(SL_ConvertToString(asset->scriptableMapEnts.instances[i].targetname));
+			dumper.dump_string(dump_script_string(&asset->scriptableMapEnts.instances[i].targetname));
 			dumper.dump_string(asset->scriptableMapEnts.instances[i].debugName);
-			dumper.dump_string(SL_ConvertToString(asset->scriptableMapEnts.instances[i].debugNameScr));
+			dumper.dump_string(dump_script_string(&asset->scriptableMapEnts.instances[i].debugNameScr));
 		}
 
 		dumper.dump_array(asset->scriptableMapEnts.runtimeData.partRuntime, asset->scriptableMapEnts.runtimeData.partRuntimeCount);

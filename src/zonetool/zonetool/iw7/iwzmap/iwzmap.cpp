@@ -2,6 +2,10 @@
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
 
+#include <array>
+#include <map>
+#include <sstream>
+
 #include "zonetool/iw7/assets/gfxworld.hpp"
 #include "zonetool/iw7/assets/gfxworld_tr.hpp"
 #include "zonetool/iw7/assets/clipmap.hpp"
@@ -219,29 +223,38 @@ namespace zonetool::iw7::iwzmap
 			std::vector<unsigned int> slots;
 			if (slot_mode)
 			{
-				std::vector<std::pair<float, unsigned int>> containing, touching;
-				for (auto i = w->dpvs.litOpaqueSurfsBegin; i < w->dpvs.litOpaqueSurfsEnd; i++)
+				// per generated surface: the smallest unused opaque template surface containing it, else the one it
+				// overlaps most (that template surface's Umbra object then governs its visibility)
+				std::vector<bool> taken(w->surfaceCount);
+				auto contained = 0u;
+				for (auto k = 0u; k < own; k++)
 				{
-					const auto& b = w->dpvs.surfacesBounds[i].bounds;
-					bool contains = true, overlaps = true;
-					for (auto a = 0; a < 3; a++)
+					const auto& g = src.surfaces[k];
+					float best_contain = 3.4e38f, best_overlap = -1.0f;
+					int contain_i = -1, overlap_i = -1;
+					for (auto i = w->dpvs.litOpaqueSurfsBegin; i < w->dpvs.litOpaqueSurfsEnd; i++)
 					{
-						const auto lo = b.midPoint[a] - b.halfSize[a], hi = b.midPoint[a] + b.halfSize[a];
-						if (lo > src.mins[a] || hi < src.maxs[a]) contains = false;
-						if (hi < src.mins[a] || lo > src.maxs[a]) overlaps = false;
+						if (taken[i]) continue;
+						const auto& b = w->dpvs.surfacesBounds[i].bounds;
+						bool contains = true;
+						float overlap = 1.0f;
+						for (auto a = 0; a < 3; a++)
+						{
+							const auto lo = b.midPoint[a] - b.halfSize[a], hi = b.midPoint[a] + b.halfSize[a];
+							if (lo > g.mins[a] || hi < g.maxs[a]) contains = false;
+							overlap *= std::max(0.0f, std::min(hi, g.maxs[a] + 1.0f) - std::max(lo, g.mins[a] - 1.0f));
+						}
+						const auto volume = b.halfSize[0] * b.halfSize[1] * std::max(b.halfSize[2], 1.0f);
+						if (contains && volume < best_contain) { best_contain = volume; contain_i = static_cast<int>(i); }
+						if (overlap > best_overlap) { best_overlap = overlap; overlap_i = static_cast<int>(i); }
 					}
-					const auto volume = b.halfSize[0] * b.halfSize[1] * std::max(b.halfSize[2], 1.0f);
-					if (contains) containing.emplace_back(volume, i);
-					else if (overlaps) touching.emplace_back(-volume, i);
+					const auto pick = contain_i >= 0 ? contain_i : overlap_i;
+					if (pick < 0) throw std::runtime_error("no template surface slot left for a generated surface");
+					if (contain_i >= 0) contained++;
+					taken[pick] = true;
+					slots.push_back(static_cast<unsigned int>(pick));
 				}
-				std::sort(containing.begin(), containing.end());
-				std::sort(touching.begin(), touching.end());
-				for (const auto& c : containing) slots.push_back(c.second);
-				for (const auto& c : touching) slots.push_back(c.second);
-				ZONETOOL_INFO("iwzmap: %zu template surfaces contain the generated world, %zu overlap it; %u needed",
-					containing.size(), touching.size(), own);
-				if (slots.size() < own) throw std::runtime_error("not enough template surface slots over the generated world");
-				slots.resize(own);
+				ZONETOOL_INFO("iwzmap: %u generated surfaces in template slots (%u contained by their slot surface)", own, contained);
 			}
 			auto* surfaces = mem->allocate<GfxSurface>(count);
 			auto* bounds = mem->allocate<GfxSurfaceBounds>(count);
@@ -509,8 +522,69 @@ namespace zonetool::iw7::iwzmap
 
 		float park(float z) { return std::getenv("IWZ_NO_PARK") ? z : -60000.0f; }
 
-		void build_ents(MapEnts* e, const std::string& bsp, const std::string& ents, const world_source& src, zone_memory* mem)
+		void add_triggers(MapEnts* e, const std::string& text, std::string& ents, zone_memory* mem)
 		{
+			struct gen { unsigned int contents; std::vector<std::array<float, 3>> halves; };
+			std::vector<gen> list;
+			std::istringstream in(text);
+			for (std::string line; std::getline(in, line);)
+			{
+				std::istringstream ls(line);
+				gen g{};
+				if (!(ls >> std::hex >> g.contents >> std::dec)) continue;
+				for (std::array<float, 3> h{}; ls >> h[0] >> h[1] >> h[2];) g.halves.push_back(h);
+				if (!g.halves.empty()) list.push_back(g);
+			}
+			if (list.empty()) return;
+			const auto base = e->trigger.count, hull_base = e->trigger.hullCount;
+			auto hulls_total = hull_base;
+			for (const auto& g : list) hulls_total += static_cast<unsigned int>(g.halves.size());
+			auto* models = mem->allocate<TriggerModel>(base + list.size());
+			std::memcpy(models, e->trigger.models, base * sizeof(TriggerModel));
+			auto* hulls = mem->allocate<TriggerHull>(hulls_total);
+			std::memcpy(hulls, e->trigger.hulls, hull_base * sizeof(TriggerHull));
+			auto h = hull_base;
+			for (auto k = 0u; k < list.size(); k++)
+			{
+				auto& tm = models[base + k];
+				tm = {};
+				tm.contents = list[k].contents;
+				tm.hullCount = static_cast<unsigned short>(list[k].halves.size());
+				tm.firstHull = static_cast<unsigned short>(h);
+				for (const auto& half : list[k].halves)
+				{
+					auto& hull = hulls[h++];
+					hull = {};
+					for (auto a = 0; a < 3; a++) hull.bounds.halfSize[a] = half[a];
+					hull.contents = list[k].contents;
+				}
+				const auto tag = "\"?IWZ" + std::to_string(k) + "\"";
+				const auto real = "\"?" + std::to_string(base + k) + "\"";
+				for (auto pos = ents.find(tag); pos != std::string::npos; pos = ents.find(tag, pos + real.size()))
+					ents.replace(pos, tag.size(), real);
+			}
+			e->trigger.models = models;
+			e->trigger.count = base + static_cast<unsigned int>(list.size());
+			e->trigger.hulls = hulls;
+			e->trigger.hullCount = hulls_total;
+			ZONETOOL_INFO("iwzmap: %zu generated trigger models (?%u..?%u)", list.size(), base, base + static_cast<unsigned int>(list.size()) - 1);
+		}
+
+		void build_ents(MapEnts* e, const std::string& bsp, std::string ents, const std::string& triggers, const std::string& relocations,
+			map_ents* strings, const world_source& src, zone_memory* mem)
+		{
+			add_triggers(e, triggers, ents, mem);
+			ZONETOOL_INFO("template triggers: %u models %u hulls %u slabs %u windings; client %u models", e->trigger.count,
+				e->trigger.hullCount, e->trigger.slabCount, e->trigger.windingCount, e->clientTrigger.trigger.count);
+			for (auto i : {0u, 4u, 20u, 21u, 22u, 145u})
+			{
+				if (i >= e->trigger.count) continue;
+				const auto& tm = e->trigger.models[i];
+				const auto& hb = e->trigger.hulls[tm.firstHull].bounds;
+				ZONETOOL_INFO("trigger model %u: contents %x hulls %u first %u windings %u flags %x hull0 mid %.0f %.0f %.0f half %.0f %.0f %.0f slabs %u",
+					i, tm.contents, tm.hullCount, tm.firstHull, tm.windingCount, tm.flags, hb.midPoint[0], hb.midPoint[1], hb.midPoint[2],
+					hb.halfSize[0], hb.halfSize[1], hb.halfSize[2], e->trigger.hulls[tm.firstHull].slabCount);
+			}
 			// one sub-model (the world, *0) to match the single GfxWorld brush model
 			if (e->numSubModels > 1 && !std::getenv("IWZ_KEEP_ENTS"))
 			{
@@ -583,17 +657,70 @@ namespace zonetool::iw7::iwzmap
 			if (!std::getenv("IWZ_CLEAR_SCRIPTABLES"))
 			{
 				e->scriptableMapEnts = scriptables;
-				auto placed = 0u;
+				// scriptables.txt: "<targetname> <n-th instance of that name> x y z yaw" moves a template scriptable
+				// (perk machine, upgrade station...) into the generated world with its name and behaviour
+				struct move { std::string name; unsigned int nth; float origin[3]; float yaw; bool used; };
+				std::vector<move> moves;
+				{
+					std::istringstream in(relocations);
+					for (std::string line; std::getline(in, line);)
+					{
+						std::istringstream ls(line);
+						move mv{};
+						if (ls >> mv.name >> mv.nth >> mv.origin[0] >> mv.origin[1] >> mv.origin[2] >> mv.yaw) moves.push_back(mv);
+					}
+				}
+				std::unordered_map<std::string, unsigned int> seen_names;
+				auto placed = 0u, relocated = 0u;
 				for (auto i = 0u; i < e->scriptableMapEnts.totalInstanceCount && e->scriptableMapEnts.instances; i++)
 				{
 					auto& inst = e->scriptableMapEnts.instances[i];
-					if (!inst.contextHeader.context.def) continue;
+					if (!inst.contextHeader.context.def)
+					{
+						if (std::getenv("IWZ_LIST_SCRIPTABLES"))
+						{
+							const auto* n = strings ? strings->get_script_string(&inst.targetname) : nullptr;
+							ZONETOOL_INFO("template scriptable without def #%u \"%s\" at %.0f %.0f %.0f", i, n ? n : "",
+								inst.contextHeader.context.origin[0], inst.contextHeader.context.origin[1], inst.contextHeader.context.origin[2]);
+						}
+						continue;
+					}
 					placed++;
-					auto park_ctx = [](ScriptableInstanceContext& c) { c.initialOrigin[2] = c.origin[2] = -60000.0f; };
-					park_ctx(inst.contextHeader.context);
-					park_ctx(inst.contextHeaderLocalClient[0].context);
-					park_ctx(inst.contextHeaderLocalClient[1].context);
-					inst.targetname = static_cast<scr_string_t>(0);
+					const auto* tn = strings ? strings->get_script_string(&inst.targetname) : nullptr;
+					std::string name = tn ? tn : "";
+					if (std::getenv("IWZ_LIST_SCRIPTABLES"))
+					{
+						const auto* dn = strings ? strings->get_script_string(&inst.debugNameScr) : nullptr;
+						ZONETOOL_INFO("template scriptable #%u tn \"%s\" debug \"%s\" / \"%s\" def %s at %.0f %.0f %.0f", i, name.data(),
+							inst.debugName ? inst.debugName : "", dn ? dn : "", inst.contextHeader.context.def->name,
+							inst.contextHeader.context.origin[0], inst.contextHeader.context.origin[1], inst.contextHeader.context.origin[2]);
+					}
+					const auto nth = name.empty() ? 0u : seen_names[name]++;
+					move* mv = nullptr;
+					for (auto& m : moves) if (!m.used && m.name == name && m.nth == nth) { mv = &m; break; }
+					auto place = [&](ScriptableInstanceContext& c)
+					{
+						if (mv)
+						{
+							for (auto a = 0; a < 3; a++) c.initialOrigin[a] = c.origin[a] = mv->origin[a];
+							c.initialAngles[0] = c.angles[0] = 0.0f;
+							c.initialAngles[1] = c.angles[1] = mv->yaw;
+							c.initialAngles[2] = c.angles[2] = 0.0f;
+						}
+						else c.initialOrigin[2] = c.origin[2] = -60000.0f;
+					};
+					place(inst.contextHeader.context);
+					place(inst.contextHeaderLocalClient[0].context);
+					place(inst.contextHeaderLocalClient[1].context);
+					if (mv) { mv->used = true; relocated++; }
+					else if (strings) strings->set_script_string(&inst.targetname, "");
+				}
+				for (const auto& m : moves)
+					if (!m.used) ZONETOOL_WARNING("iwzmap: scriptable \"%s\" #%u not found in the template", m.name.data(), m.nth);
+				ZONETOOL_INFO("iwzmap: relocated %u template scriptables", relocated);
+				if (std::getenv("IWZ_LIST_SCRIPTABLES"))
+				{
+					for (const auto& [n, c] : seen_names) ZONETOOL_INFO("template scriptable \"%s\" x%u", n.data(), c);
 				}
 				ZONETOOL_INFO("iwzmap: scriptables total %u runtime %u reserved %u; parked %u placed template instances",
 					e->scriptableMapEnts.totalInstanceCount, e->scriptableMapEnts.runtimeInstanceCount,
@@ -710,10 +837,12 @@ namespace zonetool::iw7::iwzmap
 			const auto bsp = "maps/cp/" + map + ".d3dbsp";
 			const auto src = read_world(source + "\\world.bin");
 
-			std::string hkx, graph, ents;
+			std::string hkx, graph, ents, triggers, relocations;
 			if (!utils::io::read_file(source + "\\colmap.hkx", &hkx)) throw std::runtime_error("missing colmap.hkx");
 			if (!utils::io::read_file(source + "\\navgraph.bin", &graph)) throw std::runtime_error("missing navgraph.bin");
 			if (!utils::io::read_file(source + "\\ents.txt", &ents)) throw std::runtime_error("missing ents.txt");
+			utils::io::read_file(source + "\\triggers.txt", &triggers);
+			utils::io::read_file(source + "\\scriptables.txt", &relocations);
 
 			auto mem = std::make_unique<zone_memory>(1024ull * 1024 * 1024);
 			filesystem::set_fastfile(template_zone);
@@ -812,7 +941,7 @@ namespace zonetool::iw7::iwzmap
 				build_gfx(w, tz, src, map, bsp, mem.get());
 			}
 			build_clip(c, bsp, hkx, mem.get());
-			build_ents(e, bsp, ents, src, mem.get());
+			build_ents(e, bsp, ents, triggers, relocations, &me, src, mem.get());
 			build_nav(n, bsp, graph, mem.get());
 			if (!std::getenv("IWZ_CLEAR_DYNENTS"))
 			{
@@ -846,7 +975,9 @@ namespace zonetool::iw7::iwzmap
 			gfx_world_tr::dump(tz);
 			clip_map::dump(c);
 			com_world::dump(cw);
+			map_ents::dump_string_source = &me;
 			map_ents::dump(e);
+			map_ents::dump_string_source = nullptr;
 			nav_mesh::dump(n);
 			glass_world::dump(gw);
 			fx_world::dump(fw);

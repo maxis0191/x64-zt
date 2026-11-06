@@ -11,7 +11,14 @@ namespace zonetool::iw7
 
 		std::vector<std::pair<scr_string_t*, const char*>> script_strings;
 		void add_script_string(scr_string_t* ptr, const char* str);
+
+	public:
 		const char* get_script_string(scr_string_t* ptr);
+		void set_script_string(scr_string_t* ptr, const char* str);
+		// set while dumping an asset parsed by this instance: script strings come from the parse, not the game
+		static map_ents* dump_string_source;
+
+	private:
 
 		static void dump_spawn_list(const std::string& name, SpawnPointRecordList* spawnList);
 		static void dump_spawners(const std::string& name, SpawnerList* spawners);
