@@ -3,6 +3,8 @@
 #include "iwzmap.hpp"
 
 #include <array>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <sstream>
 
@@ -35,6 +37,172 @@ namespace zonetool::iw7::iwzmap
 {
 	namespace
 	{
+		// Conservative Umbra tome (format 20, the version IW7 and IW8 ship): one tile holding one cell that lists
+		// every object, each object's bounds spanning the whole scene, so the Umbra query never culls a generated
+		// object; the renderer still frustum culls. Object user ids carry the class in bits 28-31
+		// (0 world surface, 5 reflection probe instance).
+		// Layout: header 0x170 (version 0xD6000014, CRC32C of [8, end) at +4, size at +8), 16-byte aligned blocks.
+		class tome_writer
+		{
+		public:
+			std::uint32_t block(std::size_t size)
+			{
+				align();
+				const auto offset = static_cast<std::uint32_t>(data_.size());
+				data_.resize(data_.size() + size);
+				return offset;
+			}
+
+			void align() { data_.resize((data_.size() + 15) & ~static_cast<std::size_t>(15)); }
+
+			template <typename T> void put(std::uint32_t offset, T value)
+			{
+				std::memcpy(data_.data() + offset, &value, sizeof(T));
+			}
+
+			void put_bounds(std::uint32_t offset, const float* mins, const float* maxs)
+			{
+				std::memcpy(data_.data() + offset, mins, 12);
+				std::memcpy(data_.data() + offset + 12, maxs, 12);
+			}
+
+			std::uint32_t size() const { return static_cast<std::uint32_t>(data_.size()); }
+			std::string& data() { return data_; }
+
+		private:
+			std::string data_;
+		};
+
+		std::uint32_t crc32c(const char* data, std::size_t size)
+		{
+			auto crc = 0xFFFFFFFFu;
+			for (std::size_t i = 0; i < size; i++)
+			{
+				crc ^= static_cast<std::uint8_t>(data[i]);
+				for (auto bit = 0; bit < 8; bit++) crc = (crc >> 1) ^ (0x82F63B78u & (0u - (crc & 1u)));
+			}
+			return ~crc;
+		}
+
+		std::string build_conservative_tome(const std::vector<std::uint32_t>& user_ids, const float* scene_mins, const float* scene_maxs)
+		{
+			const auto count = static_cast<std::uint32_t>(user_ids.size());
+			if (!count) throw std::runtime_error("an Umbra tome needs at least one object");
+			auto width = 1u;
+			while (width < 31 && (1u << width) < count) width++;
+
+			// pad the scene a little so no surface sits on the tile border
+			float mins[3], maxs[3];
+			for (auto a = 0; a < 3; a++) { mins[a] = scene_mins[a] - 64.0f; maxs[a] = scene_maxs[a] + 64.0f; }
+
+			tome_writer t;
+			t.block(0x170);
+			t.put<std::uint32_t>(0x00, 0xD6000014);
+			t.put<float>(0x0C, 512.0f);
+			std::memcpy(t.data().data() + 0x14, mins, 12);
+			std::memcpy(t.data().data() + 0x20, maxs, 12);
+			std::memcpy(t.data().data() + 0x150, mins, 12);
+			std::memcpy(t.data().data() + 0x15C, maxs, 12);
+			t.put<std::uint32_t>(0x40, count);
+			t.put<std::uint32_t>(0x54, width);
+			t.put<std::uint32_t>(0x5C, count);
+			t.put<std::uint32_t>(0x8C, 1); // leaf tiles
+			t.put<std::uint32_t>(0x90, 1); // tiles
+
+			// top-level tile tree: a single leaf
+			const auto top_tree = t.block(4);
+			t.put<std::uint32_t>(top_tree, 3);
+			const auto top_map = t.block(4);
+			t.put<std::uint32_t>(0x2C, 33);
+			t.put<std::uint32_t>(0x30, top_tree);
+			t.put<std::uint32_t>(0x34, top_map);
+
+			// per-object bounds (min, max) and distance boxes (min, 0, max, +inf), all scene sized
+			const auto bounds = t.block(static_cast<std::size_t>(count) * 24);
+			const auto distances = t.block(static_cast<std::size_t>(count) * 32);
+			for (auto i = 0u; i < count; i++)
+			{
+				t.put_bounds(bounds + i * 24, mins, maxs);
+				std::memcpy(t.data().data() + distances + i * 32, mins, 12);
+				t.put<float>(distances + i * 32 + 12, 0.0f);
+				std::memcpy(t.data().data() + distances + i * 32 + 16, maxs, 12);
+				t.put<float>(distances + i * 32 + 28, std::numeric_limits<float>::infinity());
+			}
+			t.put<std::uint32_t>(0x44, bounds);
+			t.put<std::uint32_t>(0x48, distances);
+
+			const auto ids = t.block(static_cast<std::size_t>(count) * 4);
+			for (auto i = 0u; i < count; i++) t.put<std::uint32_t>(ids + i * 4, user_ids[i]);
+			t.put<std::uint32_t>(0x50, ids);
+
+			// the cell's object list: indices 0..count-1, bit packed with the index width
+			const auto list_bytes = (static_cast<std::size_t>(count) * width + 31) / 32 * 4;
+			const auto list = t.block(list_bytes);
+			for (auto i = 0u; i < count; i++)
+			{
+				const auto bit0 = static_cast<std::size_t>(i) * width;
+				for (auto b = 0u; b < width; b++)
+				{
+					if (i & (1u << b))
+					{
+						t.data()[list + ((bit0 + b) >> 3)] |= static_cast<char>(1u << ((bit0 + b) & 7));
+					}
+				}
+			}
+			t.put<std::uint32_t>(0x58, list);
+
+			const auto cell_starts = t.block(8);
+			t.put<std::uint32_t>(cell_starts, 0);
+			t.put<std::uint32_t>(cell_starts + 4, 1);
+			t.put<std::uint32_t>(0x88, cell_starts);
+			const auto lod = t.block(4);
+			t.put<float>(lod, 1.0f);
+			t.put<std::uint32_t>(0x9C, lod);
+			const auto tile_table = t.block(4);
+			t.put<std::uint32_t>(0xA0, tile_table);
+			const auto expand = t.block(4);
+			t.put<float>(expand, 0.0f);
+			t.put<std::uint32_t>(0x14C, expand);
+
+			// the tile: bounds, quantization scale (largest extent over 16 bits), one leaf, one cell
+			const auto tile = t.block(0x60);
+			t.put_bounds(tile, mins, maxs);
+			t.put<std::uint32_t>(tile + 0x18, 33);
+			t.put<float>(tile + 0x30, 0.0f);
+			t.put<std::uint32_t>(tile + 0x34, 1);
+			auto extent = 0.0;
+			for (auto a = 0; a < 3; a++) extent = std::max(extent, static_cast<double>(maxs[a]) - mins[a]);
+			auto scale = static_cast<float>(extent / 65536.0);
+			if (static_cast<double>(scale) < extent / 65536.0) scale = std::nextafter(scale, std::numeric_limits<float>::infinity());
+			t.put<float>(tile + 0x44, scale);
+			t.put<float>(tile + 0x48, 1.0f / scale);
+			t.put<float>(0x168, scale); // the header repeats the root tile scale (object contribution cull)
+
+			const auto tile_tree = t.block(4);
+			t.put<std::uint32_t>(tile_tree, 3);
+			t.put<std::uint32_t>(tile + 0x1C, tile_tree - tile);
+			const auto tile_map = t.block(8);
+			t.put<std::uint32_t>(tile + 0x20, tile_map - tile);
+			const auto cell_index = t.block(8);
+			t.put<std::uint32_t>(cell_index, 0);
+			t.put<std::uint32_t>(cell_index + 4, 0xFFFFFFFF);
+			t.put<std::uint32_t>(tile + 0x40, cell_index - tile);
+			const auto cell = t.block(36);
+			t.put<std::uint32_t>(cell + 0x0C, count);
+			t.put<std::uint32_t>(cell + 0x10, 0xFFFFFFFF);
+			t.put<std::uint32_t>(cell + 0x14, 0x80000000);
+			t.put<std::uint32_t>(cell + 0x1C, 0x0000FFFF);
+			t.put<std::uint32_t>(cell + 0x20, 0xFFFFFFFF);
+			t.put<std::uint32_t>(tile + 0x38, cell - tile);
+			t.align();
+			t.put<std::uint32_t>(tile + 0x2C, ((t.size() - tile) << 8) | 3u);
+			t.put<std::uint32_t>(tile_table, tile);
+
+			t.put<std::uint32_t>(0x08, t.size());
+			t.put<std::uint32_t>(0x04, crc32c(t.data().data() + 8, t.size() - 8));
+			return t.data();
+		}
+
 		struct src_surface
 		{
 			std::uint32_t material;
@@ -155,10 +323,130 @@ namespace zonetool::iw7::iwzmap
 				w->draw.reflectionProbeData.reflectionProbeCount, w->modelCount, w->skyCount, w->umbraTomeSize, w->draw.transientZoneCount, w->draw.transientZones[0] ? w->draw.transientZones[0]->name : "-", w->draw.transientZones[1] ? w->draw.transientZones[1]->name : "-", w->draw.transientZones[2] ? w->draw.transientZones[2]->name : "-");
 		}
 
+		float half_to_float(std::uint16_t h)
+		{
+			const auto sign = (h >> 15) & 1u, exponent = (h >> 10) & 0x1Fu, mantissa = h & 0x3FFu;
+			float v;
+			if (exponent == 0) v = std::ldexp(static_cast<float>(mantissa), -24);
+			else if (exponent == 31) v = mantissa ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+			else v = std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+			return sign ? -v : v;
+		}
+
+		std::uint16_t float_to_half(float f)
+		{
+			std::uint32_t x;
+			std::memcpy(&x, &f, 4);
+			const std::uint16_t sign = static_cast<std::uint16_t>((x >> 16) & 0x8000u);
+			const auto exponent = static_cast<int>((x >> 23) & 0xFFu) - 127 + 15;
+			const auto mantissa = x & 0x7FFFFFu;
+			if (exponent <= 0) return sign;
+			if (exponent >= 31) return static_cast<std::uint16_t>(sign | 0x7C00u);
+			auto h = static_cast<std::uint32_t>((exponent << 10) | (mantissa >> 13));
+			if (mantissa & 0x1000u) h++; // round half up
+			return static_cast<std::uint16_t>(sign | h);
+		}
+
+		// Light grid probes hold RGB order-2 spherical harmonics as halves: coefficients 0-8 red, 9-17 green,
+		// 18-26 blue (0 = constant term, 2 = the vertical term, positive for light from above), then 27 sky
+		// visibility. The probes around the generated world were baked for the template's geometry there; the
+		// lighting file (lighting.txt in the source, "ambient r g b up" lines with an optional room box
+		// "box x0 y0 z0 x1 y1 z1") replaces them with the generated world's own ambient.
+		struct ambient_zone
+		{
+			float mins[3];
+			float maxs[3];
+			float rgb[3];
+			float up;
+		};
+
+		std::vector<ambient_zone> read_lighting(const std::string& path, const world_source& src)
+		{
+			std::vector<ambient_zone> zones;
+			std::string text;
+			if (!utils::io::read_file(path, &text)) return zones;
+			std::istringstream in(text);
+			std::string line;
+			while (std::getline(in, line))
+			{
+				std::istringstream l(line);
+				std::string kind;
+				l >> kind;
+				ambient_zone z{};
+				if (kind == "ambient")
+				{
+					l >> z.rgb[0] >> z.rgb[1] >> z.rgb[2] >> z.up;
+					for (auto a = 0; a < 3; a++) { z.mins[a] = src.mins[a] - 512.0f; z.maxs[a] = src.maxs[a] + 512.0f; }
+				}
+				else if (kind == "room")
+				{
+					l >> z.mins[0] >> z.mins[1] >> z.mins[2] >> z.maxs[0] >> z.maxs[1] >> z.maxs[2] >> z.rgb[0] >> z.rgb[1] >> z.rgb[2] >> z.up;
+				}
+				else continue;
+				zones.push_back(z);
+			}
+			return zones;
+		}
+
+		unsigned int relight_probes(GfxGpuLightGridProbePosition* positions, GfxSHProbeData* probes, unsigned int count,
+			const std::vector<ambient_zone>& zones)
+		{
+			auto changed = 0u;
+			for (auto i = 0u; i < count && positions && probes; i++)
+			{
+				const auto* p = positions[i].origin;
+				// the last zone containing the probe wins (rooms after the global ambient)
+				const ambient_zone* pick = nullptr;
+				for (const auto& z : zones)
+				{
+					if (p[0] >= z.mins[0] && p[0] <= z.maxs[0] && p[1] >= z.mins[1] && p[1] <= z.maxs[1] && p[2] >= z.mins[2] && p[2] <= z.maxs[2]) pick = &z;
+				}
+				if (!pick) continue;
+				for (auto c = 0; c < 3; c++)
+				{
+					for (auto k = 0; k < 9; k++) probes[i].coeffs[c * 9 + k] = 0;
+					probes[i].coeffs[c * 9 + 0] = float_to_half(pick->rgb[c]);
+					probes[i].coeffs[c * 9 + 2] = float_to_half(pick->rgb[c] * pick->up);
+				}
+				probes[i].coeffs[27] = float_to_half(1.0f);
+				changed++;
+			}
+			return changed;
+		}
+
+		// light grid probes around the generated world (inspection: IWZ_LOG_PROBES)
+		void log_probes(const GfxWorld* w, const world_source& src)
+		{
+			const auto& pd = w->lightGrid.probeData;
+			float lo[3] = {3.4e38f, 3.4e38f, 3.4e38f}, hi[3] = {-3.4e38f, -3.4e38f, -3.4e38f};
+			auto inside = 0u;
+			for (auto i = 0u; i < pd.probeCount && pd.probePositions; i++)
+			{
+				const auto* p = pd.probePositions[i].origin;
+				auto in = true;
+				for (auto a = 0; a < 3; a++)
+				{
+					lo[a] = std::min(lo[a], p[a]); hi[a] = std::max(hi[a], p[a]);
+					if (p[a] < src.mins[a] - 256.0f || p[a] > src.maxs[a] + 256.0f) in = false;
+				}
+				if (!in) continue;
+				if (inside++ < 4 && pd.probes)
+				{
+					std::string c;
+					for (auto k = 0; k < 29; k++) c += std::to_string(half_to_float(pd.probes[i].coeffs[k])).substr(0, 6) + " ";
+					ZONETOOL_INFO("probe %u at %.0f %.0f %.0f: %s", i, p[0], p[1], p[2], c.data());
+				}
+			}
+			ZONETOOL_INFO("light grid: probes %u (gpu visible %u) zones %u tetrahedrons %u (visible %u); bounds %.0f %.0f %.0f .. %.0f %.0f %.0f; %u near the generated world",
+				pd.probeCount, pd.gpuVisibleProbesCount, pd.zoneCount, pd.tetrahedronCount, pd.tetrahedronCountVisible,
+				lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], inside);
+		}
+
 		void build_gfx(GfxWorld* w, GfxWorldTransientZone* tz, const world_source& src, const std::string& map,
 			const std::string& bsp, zone_memory* mem)
 		{
 			log_template(w);
+			if (std::getenv("IWZ_LOG_PROBES")) log_probes(w, src);
 			{
 				std::string nodes;
 				for (auto i = 0; i < std::min(w->nodeCount, 16); i++) nodes += std::to_string(w->dpvsPlanes.nodes[i]) + " ";
@@ -444,6 +732,23 @@ namespace zonetool::iw7::iwzmap
 				w->umbraTomePtr2 = nullptr;
 				w->umbraUnkSize = 0;
 				w->umbraUnkData = nullptr;
+
+				// generated visibility: a conservative tome over the generated surfaces (and the reflection probe
+				// instances, whose vis bits come from the query as well)
+				if (std::getenv("IWZ_GEN_TOME"))
+				{
+					std::vector<std::uint32_t> user_ids;
+					for (auto k = 0u; k < own; k++) user_ids.push_back(k);
+					const auto probes = std::getenv("IWZ_TOME_NO_PROBES") ? 0u : w->draw.reflectionProbeData.reflectionProbeInstanceCount;
+					for (auto p = 0u; p < probes; p++) user_ids.push_back(0x50000000u + p);
+					const auto tome = build_conservative_tome(user_ids, src.mins, src.maxs);
+					w->umbraTomeSize = static_cast<unsigned int>(tome.size());
+					w->umbraTomeData = mem->allocate<char>(tome.size());
+					std::memcpy(w->umbraTomeData, tome.data(), tome.size());
+					ZONETOOL_INFO("iwzmap: generated conservative Umbra tome (%u bytes, %u surfaces, %u probe instances)",
+						w->umbraTomeSize, own, probes);
+					if (const auto* out = std::getenv("IWZ_DUMP_TOME")) utils::io::write_file(std::string(out) + ".gen.tome", tome);
+				}
 			}
 
 			ZONETOOL_INFO("template dpvsDyn: clients %u %u words %u %u", w->dpvsDyn.dynEntClientCount[0], w->dpvsDyn.dynEntClientCount[1],
@@ -940,6 +1245,14 @@ namespace zonetool::iw7::iwzmap
 			else
 			{
 				build_gfx(w, tz, src, map, bsp, mem.get());
+				const auto zones = read_lighting(source + "\\lighting.txt", src);
+				if (!zones.empty())
+				{
+					auto& grid = w->lightGrid.probeData;
+					const auto a = relight_probes(grid.probePositions, grid.probes, grid.probeCount, zones);
+					const auto b = relight_probes(grid.gpuVisibleProbePositions, grid.gpuVisibleProbesData, grid.gpuVisibleProbesCount, zones);
+					ZONETOOL_INFO("iwzmap: relit %u light grid probes (%u gpu visible) from %zu lighting zones", a, b, zones.size());
+				}
 			}
 			build_clip(c, bsp, hkx, mem.get());
 			build_ents(e, bsp, ents, triggers, relocations, &me, src, mem.get());
