@@ -926,12 +926,13 @@ namespace zonetool::iw7::iwzmap
 			auto* sorted = mem->allocate<unsigned short>(std::max(n, 1u));
 			std::unordered_map<std::string, XModel*> stubs;
 			auto copied = 0u;
+			auto range_end = 0u;
 			for (auto i = 0u; i < n; i++)
 			{
 				const auto& s = list[i];
 				const auto t = by_model.contains(s.model) ? by_model[s.model] : static_cast<unsigned int>(grid_template);
 				if (by_model.contains(s.model)) copied++;
-				else ZONETOOL_WARNING("iwzmap: static model %s has no light grid lit template instance; using the defaults of %s", s.model.data(),
+				else if (!stubs.contains(s.model)) ZONETOOL_WARNING("iwzmap: static model %s has no light grid lit template instance; using the defaults of %s", s.model.data(),
 					d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
 				auto& dinst = draws[i];
 				dinst = d.smodelDrawInsts[t];
@@ -957,7 +958,7 @@ namespace zonetool::iw7::iwzmap
 				auto& sinst = insts[i];
 				sinst.bounds = make_bounds(s.mins, s.maxs);
 				for (auto a = 0; a < 3; a++) sinst.lightingOrigin[a] = sinst.bounds.midPoint[a];
-				lod[i] = d.lodData ? d.lodData[t] : 0;
+				lod[i] = 0; // stock values are unique per instance with no relation to the other fields: runtime-like, start at 0
 				sorted[i] = static_cast<unsigned short>(i);
 			}
 			lod[n] = 0;
