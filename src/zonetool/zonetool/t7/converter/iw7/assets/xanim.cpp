@@ -64,64 +64,82 @@ namespace zonetool::t7
 				new_asset->randomDataByte = reinterpret_cast<char*>(asset->randomDataByte);
 				new_asset->randomDataInt = reinterpret_cast<int*>(asset->randomDataInt);
 
+				new_asset->indices.data = reinterpret_cast<void*>(asset->indices.data);
+
 				// Credits: Scobalula/Greyhound CoDXAnimTranslator::TranslateXAnim
 				if (new_asset->dataShortCount)
 				{
-					new_asset->dataShort = allocator.allocate_array<short>(new_asset->dataShortCount);
 					new_asset->randomDataShort = allocator.allocate_array<short>(new_asset->randomDataShortCount);
-
-					std::memcpy(new_asset->dataShort, asset->dataShort, sizeof(short) * new_asset->dataShortCount);
 					std::memcpy(new_asset->randomDataShort, asset->randomDataShort, sizeof(short) * new_asset->randomDataShortCount);
 
-					short* newData = new_asset->dataShort;
 					short* newRandom = new_asset->randomDataShort;
 					short* data = asset->dataShort;
 					short* random = asset->randomDataShort;
-					short* const data_end = new_asset->dataShort + new_asset->dataShortCount;
+					short* const data_end = asset->dataShort + asset->dataShortCount;
 					short* const random_end = new_asset->randomDataShort + new_asset->randomDataShortCount;
 
-					// Every write stays inside the arrays sized by the source counts; a
-					// channel layout that does not fit is refused instead of overrunning.
-					const auto check = [&](short* dst, short* end, uint32_t count)
+					// The short channel data is rebuilt: long IW7 animations do not keep
+					// the key frame indices of large channels inline (see below), so the
+					// output can be shorter than the source. Every read stays inside the
+					// source counts; a layout that does not fit is refused.
+					std::vector<short> out;
+					out.reserve(asset->dataShortCount);
+					std::vector<unsigned short> rotation_indices;
+
+					const auto check = [&](const short* src, const short* end, uint32_t count)
 					{
-						if (dst + count > end)
+						if (src + count > end)
 						{
 							throw std::runtime_error(utils::string::va("xanim \"%s\": short channel data exceeds its count",
 								asset->name));
 						}
 					};
 
-					auto readConvert = [&](short*& dst, short*& src, uint32_t count, short* end)
+					auto readRandom = [&](uint32_t count)
 					{
-						check(dst, end, count);
+						check(newRandom, random_end, count);
 						for (uint32_t i = 0; i < count; ++i)
-							*dst++ = QuatInt16::ToInt16(half_float::half_to_float(*src++));
+							*newRandom++ = QuatInt16::ToInt16(half_float::half_to_float(*random++));
 					};
 
-					auto readRaw = [&](short*& dst, short*& src, uint32_t count = 1)
-					{
-						check(dst, data_end, count);
-						for (uint32_t i = 0; i < count; ++i)
-							*dst++ = *src++;
-					};
-
-					const uint32_t frameSize = (asset->numframes > 255) ? 2 : 1;
+					const bool long_anim = asset->numframes > 255;
 
 					auto processBoneData = [&](int boneCountIndex, int rotSize)
 					{
 						for (int i = 0; i < asset->boneCount[boneCountIndex]; ++i)
 						{
-							check(newData, data_end, 1);
-							const uint16_t frameCount = *data;
-							readRaw(newData, data); // Frame count
+							check(data, data_end, 1);
+							const uint16_t frameCount = static_cast<uint16_t>(*data++);
+							out.push_back(static_cast<short>(frameCount)); // Frame count
 
-							// Animations longer than 255 frames keep their key frame indices
-							// inline as shorts: one per key frame (frameCount + 1).
-							if (frameSize == 2)
-								readRaw(newData, data, frameCount + 1u); // Frame indices
+							if (long_anim)
+							{
+								// BO3 keeps every key frame index inline (frameCount + 1 shorts).
+								// IW7 does the same only below 64 keys; larger channels keep a
+								// lookup table inline (the key at every 256th position, then the
+								// last key) and their full index list in XAnimParts::indices,
+								// consumed channel after channel. Verified on every long stock
+								// IW7 animation dumped from cp_zmb.
+								const uint32_t keys = frameCount + 1u;
+								check(data, data_end, keys);
+								if (frameCount >= 64)
+								{
+									const uint32_t table = ((frameCount - 1u) >> 8) + 2u;
+									for (uint32_t t = 0; t + 1 < table; ++t)
+										out.push_back(data[t * 256u]);
+									out.push_back(data[frameCount]);
+									for (uint32_t k = 0; k < keys; ++k)
+										rotation_indices.push_back(static_cast<unsigned short>(data[k]));
+								}
+								else
+								{
+									out.insert(out.end(), data, data + keys);
+								}
+								data += keys;
+							}
 
 							for (int f = 0; f < frameCount + 1; ++f)
-								readConvert(newRandom, random, rotSize, random_end); // Rotation data
+								readRandom(rotSize); // Rotation data
 						}
 					};
 
@@ -131,14 +149,48 @@ namespace zonetool::t7
 					auto processStaticBoneData = [&](int boneCountIndex, int rotSize)
 					{
 						for (int i = 0; i < asset->boneCount[boneCountIndex]; ++i)
-							readConvert(newData, data, rotSize, data_end); // Static rotation data
+						{
+							check(data, data_end, rotSize);
+							for (int r = 0; r < rotSize; ++r)
+								out.push_back(QuatInt16::ToInt16(half_float::half_to_float(*data++))); // Static rotation data
+						}
 					};
 
 					processStaticBoneData(TwoDStaticRotatedBoneCount, 2);
 					processStaticBoneData(NormalStaticRotatedBoneCount, 4);
-				}
 
-				new_asset->indices.data = reinterpret_cast<void*>(asset->indices.data);
+					// Remaining channel data (translations) is kept as is.
+					out.insert(out.end(), data, data_end);
+
+					if (out.size() > std::numeric_limits<unsigned short>::max())
+					{
+						throw std::runtime_error(utils::string::va("xanim \"%s\": short channel data exceeds the IW7 count",
+							asset->name));
+					}
+					new_asset->dataShortCount = static_cast<unsigned short>(out.size());
+					new_asset->dataShort = allocator.allocate_array<short>(new_asset->dataShortCount);
+					std::memcpy(new_asset->dataShort, out.data(), sizeof(short) * out.size());
+
+					if (!rotation_indices.empty())
+					{
+						// Rotation channels come first in IW7's index list; any source
+						// indices (translations) follow them.
+						const auto* source = static_cast<const unsigned short*>(asset->indices.data);
+						if (asset->indexCount && !source)
+						{
+							throw std::runtime_error(utils::string::va("xanim \"%s\": index list missing", asset->name));
+						}
+						rotation_indices.insert(rotation_indices.end(), source, source + asset->indexCount);
+						if (rotation_indices.size() > std::numeric_limits<decltype(new_asset->indexCount)>::max())
+						{
+							throw std::runtime_error(utils::string::va("xanim \"%s\": index list exceeds the IW7 count", asset->name));
+						}
+						auto* indices = allocator.allocate_array<unsigned short>(rotation_indices.size());
+						std::memcpy(indices, rotation_indices.data(), sizeof(unsigned short) * rotation_indices.size());
+						new_asset->indices.data = indices;
+						new_asset->indexCount = static_cast<decltype(new_asset->indexCount)>(rotation_indices.size());
+					}
+				}
 
 				new_asset->notify = allocator.allocate_array<zonetool::iw7::XAnimNotifyInfo>(new_asset->notifyCount);
 				for (auto i = 0; i < asset->notifyCount; i++)
