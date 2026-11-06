@@ -1,6 +1,7 @@
 #include <std_include.hpp>
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
+#include "iwzmap_lightmap.hpp"
 
 #include <array>
 #include <cmath>
@@ -1284,8 +1285,11 @@ namespace zonetool::iw7::iwzmap
 			fw->glassSys.initGeoData = nullptr;
 			if (pd) pd->name = mem->duplicate_string(bsp);
 
+			// baked lightmap (source\lightmap\): template image headers are read before switching to the new map
+			const auto baked = std::getenv("IWZ_KEEP_GFX") ? baked_lightmap{} : prepare_lightmap(w, source, mem.get());
 			filesystem::set_fastfile(map);
 			gfx_world::dump(w);
+			dump_lightmap(baked);
 			gfx_world_tr::dump(tz);
 			clip_map::dump(c);
 			com_world::dump(cw);
