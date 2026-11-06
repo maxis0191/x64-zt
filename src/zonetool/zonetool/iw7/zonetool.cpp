@@ -1033,6 +1033,17 @@ namespace zonetool::iw7
 			iwzmap::compile(params.get(1), params.get(2), params.get(3), params.get(4));
 		});
 
+		::iw7::command::add("iwzbounds", [](const ::iw7::command::params& params)
+		{
+			if (params.size() < 4)
+			{
+				ZONETOOL_ERROR("usage: iwzbounds <template zone> <smodels.txt> <out.json>");
+				return;
+			}
+
+			iwzmap::smodel_bounds(params.get(1), params.get(2), params.get(3));
+		});
+
 		::iw7::command::add("buildzone", [](const ::iw7::command::params& params)
 		{
 			if (params.size() != 2)
@@ -1220,6 +1231,13 @@ namespace zonetool::iw7
 					{
 						iwzmap::compile(args[i + 1], args[i + 2], args[i + 3], args[i + 4]);
 						i += 4;
+
+						do_exit = true;
+					}
+					else if (args[i] == "-iwzbounds" && i + 3 < args.size())
+					{
+						iwzmap::smodel_bounds(args[i + 1], args[i + 2], args[i + 3]);
+						i += 3;
 
 						do_exit = true;
 					}
