@@ -942,6 +942,11 @@ namespace zonetool::iw7::iwzmap
 					for (auto k = 0; k < 3; k++) dinst.placement.axis[k][a] = s.axis[k][a];
 				}
 				dinst.placement.scale = s.scale;
+				// stock (unk1:unk0, unk3) ranges are contiguous and never overlap across all instances (0..92061 in
+				// cp_zmb): give each generated instance its own range of its template's length
+				dinst.unk0 = static_cast<unsigned short>(range_end & 0xFFFF);
+				dinst.unk1 = static_cast<unsigned short>(range_end >> 16);
+				range_end += dinst.unk3;
 				if (!stubs.contains(s.model)) stubs[s.model] = name_stub<XModel>(mem, s.model);
 				dinst.model = stubs[s.model];
 				std::memset(&dinst.vertexLightingInfo, 0, sizeof(dinst.vertexLightingInfo));
@@ -971,7 +976,7 @@ namespace zonetool::iw7::iwzmap
 			d.smodelDrawInsts = n ? draws : nullptr;
 			d.sortedSmodelIndices = n ? sorted : nullptr;
 			d.lodData = lod;
-			ZONETOOL_INFO("iwzmap: %u static models (%u with a same-model template instance, %zu models)", n, copied, stubs.size());
+			ZONETOOL_INFO("iwzmap: %u static models (%u with a same-model template instance, %zu models, ranges %u)", n, copied, stubs.size(), range_end);
 		}
 
 		// Primary lights: each generated light takes a static template light slot of the same type (and shadow
@@ -1099,6 +1104,10 @@ namespace zonetool::iw7::iwzmap
 		void build_gfx_lights(GfxWorld* w, const std::vector<ComPrimaryLight>& before, const ComWorld* cw, const std::vector<light_source>& lights,
 			const world_source& src, zone_memory* mem)
 		{
+			// the template lights that are not reused keep no shadow casters: their lists index template surfaces and
+			// static models that the generated world does not have
+			if (w->shadowGeomOptimized && !std::getenv("IWZ_KEEP_TEMPLATE_SHADOWGEOM"))
+				for (auto k = 0u; k < w->primaryLightCount; k++) w->shadowGeomOptimized[k] = {};
 			for (auto li = 0u; li < lights.size(); li++)
 			{
 				const auto& l = lights[li];
