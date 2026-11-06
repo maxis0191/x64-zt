@@ -3,6 +3,8 @@
 #include "iwzmap.hpp"
 
 #include <array>
+#include <bit>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -613,6 +615,111 @@ namespace zonetool::iw7::iwzmap
 			return s;
 		}
 
+		// Static light voxel tree (Forward+ light binning of the static spot/omni primary lights), as read from cp_zmb:
+		// - header: root node grid dimensions (x, y, z), node coordinate bit shifts {9, 7, 5} (512, 128, 32 units),
+		//   bound min/max of the root grid;
+		// - one top-down node per root column: first internal node index of the column's lowest root and its root
+		//   z range (roots of one column are consecutive internal nodes; outside the range there is no light);
+		// - internal node: 4x4x4 children as a 64-bit mask in two words; word w's children are numbered from
+		//   firstNodeIndex[w] in bit order; an index with bit 31 set is a leaf, else an internal node (child size =
+		//   parent size / 4). Internal node 0 and leaf 0 are reserved;
+		// - leaf: u16 address into lightListArray; a list is a header (spot count << 7 | omni count) followed by the
+		//   spot then the omni light indices. Address 2 is the empty list.
+		// The column order and the bit -> axis order are verified against the template's light positions
+		// (IWZ_LOG_STATICS: "voxel: hypothesis"); voxel_layout holds the verified one.
+		struct voxel_layout
+		{
+			int column_x_major = 1; // top-down index = x + y * dimX
+			int perm = 0;           // bit fields (b & 3, b >> 2 & 3, b >> 4) -> axes {perm table}
+		};
+
+		constexpr int voxel_perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+
+		template <typename F>
+		void voxel_visit(const GfxVoxelTree& t, const voxel_layout& lay, F&& leaf)
+		{
+			const auto* h = t.voxelTreeHeader;
+			const int dim[3] = {h->rootNodeDimension[0], h->rootNodeDimension[1], h->rootNodeDimension[2]};
+			const auto root = static_cast<float>(1 << h->nodeCoordBitShift[0]);
+			const auto* fields = voxel_perms[lay.perm];
+			std::function<void(int, const float*, float)> walk = [&](int node, const float* org, float size)
+			{
+				if (node <= 0 || node >= t.voxelInternalNodeCount) return;
+				const auto& in = t.voxelInternalNodeArray[node];
+				const auto child = size / 4.0f;
+				for (auto b = 0; b < 64; b++)
+				{
+					const auto w = b >> 5;
+					const auto bit = static_cast<unsigned>(b & 31);
+					const auto mask = static_cast<unsigned>(in.childNodeMask[w]);
+					if (!(mask & (1u << bit))) continue;
+					const auto rank = std::popcount(mask & ((1u << bit) - 1u));
+					const auto first = static_cast<unsigned>(in.firstNodeIndex[w]);
+					const int f[3] = {b & 3, (b >> 2) & 3, (b >> 4) & 3};
+					float o[3] = {org[0], org[1], org[2]};
+					for (auto k = 0; k < 3; k++) o[fields[k]] += f[k] * child;
+					const auto idx = (first & 0x7FFFFFFFu) + rank;
+					if (first & 0x80000000u) leaf(static_cast<int>(idx), o, child);
+					else walk(static_cast<int>(idx), o, child);
+				}
+			};
+			for (auto k = 0; k < t.voxelTopDownViewNodeCount; k++)
+			{
+				const auto& td = t.voxelTopDownViewNodeArray[k];
+				if (td.zMax < td.zMin || (!td.firstNodeIndex && !td.zMin && !td.zMax)) continue;
+				const auto tx = lay.column_x_major ? k % dim[0] : k / dim[1];
+				const auto ty = lay.column_x_major ? k / dim[0] : k % dim[1];
+				for (auto z = td.zMin; z <= td.zMax; z++)
+				{
+					const float org[3] = {h->boundMin[0] + tx * root, h->boundMin[1] + ty * root, h->boundMin[2] + z * root};
+					walk(td.firstNodeIndex + (z - td.zMin), org, root);
+				}
+			}
+		}
+
+		bool box_touches_sphere(const float* mins, float size, const float* c, float r)
+		{
+			auto d2 = 0.0f;
+			for (auto a = 0; a < 3; a++)
+			{
+				const auto v = std::clamp(c[a], mins[a], mins[a] + size);
+				d2 += (v - c[a]) * (v - c[a]);
+			}
+			return d2 <= r * r;
+		}
+
+		// scores every layout hypothesis: share of (leaf, listed light) pairs whose leaf box touches the light sphere
+		void voxel_hypotheses(const GfxVoxelTree& t, const ComWorld* cw)
+		{
+			for (auto major = 0; major < 2; major++)
+			{
+				for (auto p = 0; p < 6; p++)
+				{
+					voxel_layout lay{major, p};
+					std::uint64_t ok = 0, total = 0, leaves = 0;
+					voxel_visit(t, lay, [&](int leaf, const float* o, float size)
+					{
+						if (leaf <= 0 || leaf >= t.voxelLeafNodeCount) return;
+						const auto addr = t.voxelLeafNodeArray[leaf].lightListAddress;
+						if (addr >= static_cast<unsigned>(t.lightListArraySize)) return;
+						const auto hdr = t.lightListArray[addr];
+						const auto n = (hdr >> 7) + (hdr & 0x7F);
+						leaves++;
+						for (auto q = 0; q < n && addr + 1 + q < t.lightListArraySize; q++)
+						{
+							const auto li = t.lightListArray[addr + 1 + q];
+							if (li >= cw->primaryLightCount) continue;
+							const auto& l = cw->primaryLights[li];
+							total++;
+							if (box_touches_sphere(o, size, l.origin, l.radius + 1.0f)) ok++;
+						}
+					});
+					ZONETOOL_INFO("voxel: hypothesis column %s perm %d%d%d: %llu / %llu light refs inside the light sphere (%llu leaves)",
+						major ? "x-major" : "y-major", voxel_perms[p][0], voxel_perms[p][1], voxel_perms[p][2], ok, total, leaves);
+				}
+			}
+		}
+
 		// inspection of the template's static models, their collision and the primary lights (IWZ_LOG_STATICS)
 		void log_statics(const GfxWorld* w, const GfxWorldTransientZone* tz, const clipMap_t* c, const ComWorld* cw)
 		{
@@ -795,6 +902,58 @@ namespace zonetool::iw7::iwzmap
 				std::string s;
 				for (auto k = 0; k < std::min(t.lightListArraySize, 32); k++) s += std::to_string(t.lightListArray[k]) + " ";
 				ZONETOOL_INFO("lights: voxel lightList head %s", s.data());
+				// structure probes (voxel tree format inspection)
+				auto pc = [](int v) { return static_cast<unsigned>(std::popcount(static_cast<unsigned>(v))); };
+				std::uint64_t m0 = 0;
+				for (auto k = 0; k < t.voxelInternalNodeCount; k++)
+				{
+					const auto& in = t.voxelInternalNodeArray[k];
+					m0 += pc(in.childNodeMask[0]) + pc(in.childNodeMask[1]);
+				}
+				ZONETOOL_INFO("voxel: internal mask popcount total %llu (internal %d leaf %d)", m0, t.voxelInternalNodeCount, t.voxelLeafNodeCount);
+				for (auto k = 0; k < std::min(t.voxelInternalNodeCount, 12); k++)
+				{
+					const auto& in = t.voxelInternalNodeArray[k];
+					ZONETOOL_INFO("voxel: internal %d first %d %d mask %08x %08x", k, in.firstNodeIndex[0], in.firstNodeIndex[1], in.childNodeMask[0], in.childNodeMask[1]);
+				}
+				for (auto k = t.voxelInternalNodeCount - 4; k < t.voxelInternalNodeCount; k++)
+				{
+					if (k < 0) continue;
+					const auto& in = t.voxelInternalNodeArray[k];
+					ZONETOOL_INFO("voxel: internal %d first %d %d mask %08x %08x", k, in.firstNodeIndex[0], in.firstNodeIndex[1], in.childNodeMask[0], in.childNodeMask[1]);
+				}
+				auto shown = 0;
+				std::uint64_t zsum = 0;
+				for (auto k = 0; k < t.voxelTopDownViewNodeCount; k++)
+				{
+					const auto& td = t.voxelTopDownViewNodeArray[k];
+					if (td.zMax >= td.zMin) zsum += td.zMax - td.zMin + 1;
+					if (td.firstNodeIndex >= 0 && shown < 12 && (td.zMin || td.zMax || td.firstNodeIndex))
+					{
+						ZONETOOL_INFO("voxel: topdown %d (x %d y %d) first %d z %d..%d", k, k % t.voxelTreeHeader->rootNodeDimension[0],
+							k / t.voxelTreeHeader->rootNodeDimension[0], td.firstNodeIndex, td.zMin, td.zMax);
+						shown++;
+					}
+				}
+				ZONETOOL_INFO("voxel: topdown z span sum %llu", zsum);
+				std::map<unsigned, unsigned> addr_hist;
+				for (auto k = 0; k < t.voxelLeafNodeCount; k++) addr_hist[t.voxelLeafNodeArray[k].lightListAddress]++;
+				std::vector<std::pair<unsigned, unsigned>> top(addr_hist.begin(), addr_hist.end());
+				std::sort(top.begin(), top.end(), [](auto& a, auto& b) { return a.second > b.second; });
+				ZONETOOL_INFO("voxel: %zu distinct leaf addresses", addr_hist.size());
+				for (auto k = 0u; k < std::min<std::size_t>(top.size(), 12); k++)
+				{
+					std::string ls;
+					for (auto q = top[k].first; q < std::min<unsigned>(top[k].first + 10, t.lightListArraySize); q++) ls += std::to_string(t.lightListArray[q]) + " ";
+					ZONETOOL_INFO("voxel: leaf address %u x%u -> %s", top[k].first, top[k].second, ls.data());
+				}
+				std::string first_leaves;
+				for (auto k = 0; k < std::min(t.voxelLeafNodeCount, 64); k++) first_leaves += std::to_string(t.voxelLeafNodeArray[k].lightListAddress) + " ";
+				ZONETOOL_INFO("voxel: first leaves %s", first_leaves.data());
+				if (t.voxelInternalNodeDynamicLightList)
+					ZONETOOL_INFO("voxel: dynamic light list %u %u %u %u", t.voxelInternalNodeDynamicLightList[0], t.voxelInternalNodeDynamicLightList[1],
+						t.voxelInternalNodeDynamicLightList[2], t.voxelInternalNodeDynamicLightList[3]);
+				voxel_hypotheses(t, cw);
 			}
 			std::map<int, unsigned> type_hist;
 			for (auto k = 0u; k < cw->primaryLightCount; k++) type_hist[cw->primaryLights[k].type]++;
@@ -871,6 +1030,18 @@ namespace zonetool::iw7::iwzmap
 				std::string s;
 				for (auto k = 0u; k < std::min<unsigned>(w->lightAABB.lightCount, 24); k++) s += std::to_string(w->lightAABB.lightArray[k]) + " ";
 				ZONETOOL_INFO("light aabb lights head %s", s.data());
+				// which lights the aabb tree holds
+				std::map<std::string, unsigned> in_tree, all;
+				std::set<unsigned> listed(w->lightAABB.lightArray, w->lightAABB.lightArray + w->lightAABB.lightCount);
+				for (auto k = 0u; k < cw->primaryLightCount; k++)
+				{
+					const auto& l = cw->primaryLights[k];
+					const auto key = "type " + std::to_string(l.type) + " shadow " + std::to_string(l.canUseShadowMap) + " dyn " + std::to_string(l.needsDynamicShadows) +
+						" vol " + std::to_string(l.isVolumetric) + (k >= cw->firstScriptablePrimaryLight ? " scriptable" : "");
+					all[key]++;
+					if (listed.contains(k)) in_tree[key]++;
+				}
+				for (const auto& [key, n] : all) ZONETOOL_INFO("light aabb: %s: %u lights, %u in the tree", key.data(), n, in_tree.contains(key) ? in_tree[key] : 0u);
 			}
 		}
 
@@ -1194,6 +1365,196 @@ namespace zonetool::iw7::iwzmap
 					moved_vertices, o.origin[0], o.origin[1], o.origin[2], t.scale, w->shadowGeomOptimized ? w->shadowGeomOptimized[k].surfaceCount : 0,
 					w->shadowGeomOptimized ? w->shadowGeomOptimized[k].smodelCount : 0);
 			}
+		}
+
+		// Generated static light voxel tree (format: see voxel_visit): roots of 512 units over the generated world,
+		// 128-unit internal nodes, 32-unit leaves listing the generated lights whose sphere touches them. The template
+		// tree binned the template lights at their cp_zmb places (which the generated world overlaps), so it is
+		// always replaced: without lights.txt every leaf is empty.
+		void build_voxel_tree(GfxWorld* w, const ComWorld* cw, const std::vector<light_source>& lights, const world_source& src,
+			const voxel_layout& lay, zone_memory* mem)
+		{
+			if (!w->voxelTreeCount || !w->voxelTree || !w->voxelTree[0].voxelTreeHeader || std::getenv("IWZ_KEEP_VOXELS")) return;
+			auto& t = w->voxelTree[0];
+			const auto* old = t.voxelTreeHeader;
+			constexpr auto root = 512.0f;
+			float lo[3], hi[3];
+			for (auto a = 0; a < 3; a++) { lo[a] = src.mins[a]; hi[a] = src.maxs[a]; }
+			for (const auto& l : lights)
+				for (auto a = 0; a < 3; a++) { lo[a] = std::min(lo[a], l.origin[a] - l.radius); hi[a] = std::max(hi[a], l.origin[a] + l.radius); }
+			int dim[3];
+			float base[3];
+			for (auto a = 0; a < 3; a++)
+			{
+				base[a] = std::floor(lo[a] / root) * root;
+				dim[a] = std::max(1, static_cast<int>(std::ceil((hi[a] - base[a]) / root)));
+			}
+			auto* h = mem->allocate<GfxVoxelTreeHeader>();
+			*h = *old;
+			for (auto a = 0; a < 3; a++)
+			{
+				h->rootNodeDimension[a] = dim[a];
+				h->boundMin[a] = base[a];
+				h->boundMax[a] = base[a] + dim[a] * root;
+			}
+			h->rootNodeDimension[3] = 0;
+			h->nodeCoordBitShift[0] = 9; h->nodeCoordBitShift[1] = 7; h->nodeCoordBitShift[2] = 5; h->nodeCoordBitShift[3] = 0;
+			h->boundMin[3] = h->boundMax[3] = 0.0f;
+
+			// light lists
+			std::vector<unsigned short> arr = {t.lightListArraySize > 1 ? t.lightListArray[0] : static_cast<unsigned short>(16384),
+				t.lightListArraySize > 1 ? t.lightListArray[1] : static_cast<unsigned short>(1), 0};
+			std::map<std::vector<unsigned short>, unsigned short> addresses;
+			addresses[{}] = 2;
+			auto touching = [&](const float* o, float size)
+			{
+				std::vector<unsigned short> spots, omnis;
+				for (const auto& l : lights)
+				{
+					if (!box_touches_sphere(o, size, l.origin, l.radius)) continue;
+					(cw->primaryLights[l.slot].type == GFX_LIGHT_TYPE_SPOT ? spots : omnis).push_back(static_cast<unsigned short>(l.slot));
+				}
+				std::sort(spots.begin(), spots.end());
+				std::sort(omnis.begin(), omnis.end());
+				std::vector<unsigned short> key;
+				if (spots.empty() && omnis.empty()) return key;
+				key.push_back(static_cast<unsigned short>((spots.size() << 7) | omnis.size()));
+				key.insert(key.end(), spots.begin(), spots.end());
+				key.insert(key.end(), omnis.begin(), omnis.end());
+				return key;
+			};
+			auto address = [&](const std::vector<unsigned short>& key) -> unsigned short
+			{
+				if (const auto it = addresses.find(key); it != addresses.end()) return it->second;
+				if (arr.size() + key.size() > 0xFFFF) throw std::runtime_error("voxel light lists exceed 65535 entries");
+				const auto a = static_cast<unsigned short>(arr.size());
+				arr.insert(arr.end(), key.begin(), key.end());
+				addresses[key] = a;
+				return a;
+			};
+			auto any_light = [&](const float* o, float size)
+			{
+				for (const auto& l : lights) if (box_touches_sphere(o, size, l.origin, l.radius)) return true;
+				return false;
+			};
+
+			std::vector<GfxVoxelInternalNode> internal(1);
+			std::vector<GfxVoxelLeafNode> leaves(1);
+			leaves[0].lightListAddress = 0;
+			const auto* fields = voxel_perms[lay.perm];
+			auto child_origin = [&](const float* org, float child, int b, float* o)
+			{
+				const int f[3] = {b & 3, (b >> 2) & 3, (b >> 4) & 3};
+				for (auto a = 0; a < 3; a++) o[a] = org[a];
+				for (auto k = 0; k < 3; k++) o[fields[k]] += f[k] * child;
+			};
+			// fills internal node `node` (already reserved) covering org..org+size; children of 128-unit nodes are leaves
+			std::function<void(std::size_t, const float*, float)> fill = [&](std::size_t node, const float* org, float size)
+			{
+				const auto child = size / 4.0f;
+				const auto leaf_children = child <= 32.0f;
+				GfxVoxelInternalNode in{};
+				std::vector<std::pair<std::size_t, std::array<float, 3>>> recurse;
+				for (auto word = 0; word < 2; word++)
+				{
+					unsigned mask = 0;
+					const auto first = leaf_children ? leaves.size() : internal.size();
+					std::vector<std::array<float, 3>> kids;
+					for (auto bit = 0; bit < 32; bit++)
+					{
+						float o[3];
+						child_origin(org, child, word * 32 + bit, o);
+						if (!any_light(o, child)) continue;
+						mask |= 1u << bit;
+						kids.push_back({o[0], o[1], o[2]});
+					}
+					in.childNodeMask[word] = static_cast<int>(mask);
+					in.firstNodeIndex[word] = static_cast<int>(leaf_children ? (0x80000000u | static_cast<unsigned>(first)) : static_cast<unsigned>(first));
+					if (!mask) in.firstNodeIndex[word] = 0;
+					for (const auto& o : kids)
+					{
+						if (leaf_children)
+						{
+							GfxVoxelLeafNode leaf{};
+							leaf.lightListAddress = address(touching(o.data(), child));
+							leaves.push_back(leaf);
+						}
+						else
+						{
+							recurse.emplace_back(internal.size(), o);
+							internal.push_back({});
+						}
+					}
+				}
+				internal[node] = in;
+				for (const auto& [idx, o] : recurse) fill(idx, o.data(), child);
+			};
+
+			std::vector<GfxVoxelTopDownViewNode> columns(static_cast<std::size_t>(dim[0]) * dim[1]);
+			for (auto ty = 0; ty < dim[1]; ty++)
+			{
+				for (auto tx = 0; tx < dim[0]; tx++)
+				{
+					const auto k = lay.column_x_major ? tx + ty * dim[0] : ty + tx * dim[1];
+					auto& td = columns[k];
+					td = {};
+					auto z0 = -1, z1 = -1;
+					for (auto z = 0; z < dim[2]; z++)
+					{
+						const float o[3] = {base[0] + tx * root, base[1] + ty * root, base[2] + z * root};
+						if (!any_light(o, root)) continue;
+						if (z0 < 0) z0 = z;
+						z1 = z;
+					}
+					if (z0 < 0) continue;
+					td.firstNodeIndex = static_cast<int>(internal.size());
+					td.zMin = z0;
+					td.zMax = z1;
+					const auto first = internal.size();
+					internal.resize(internal.size() + (z1 - z0 + 1));
+					for (auto z = z0; z <= z1; z++)
+					{
+						const float o[3] = {base[0] + tx * root, base[1] + ty * root, base[2] + z * root};
+						fill(first + (z - z0), o, root);
+					}
+				}
+			}
+
+			t.voxelTreeHeader = h;
+			t.voxelTopDownViewNodeCount = static_cast<int>(columns.size());
+			t.voxelTopDownViewNodeArray = mem->allocate<GfxVoxelTopDownViewNode>(columns.size());
+			std::memcpy(t.voxelTopDownViewNodeArray, columns.data(), columns.size() * sizeof(GfxVoxelTopDownViewNode));
+			t.voxelInternalNodeCount = static_cast<int>(internal.size());
+			t.voxelInternalNodeArray = mem->allocate<GfxVoxelInternalNode>(internal.size());
+			std::memcpy(t.voxelInternalNodeArray, internal.data(), internal.size() * sizeof(GfxVoxelInternalNode));
+			t.voxelLeafNodeCount = static_cast<int>(leaves.size());
+			t.voxelLeafNodeArray = mem->allocate<GfxVoxelLeafNode>(leaves.size());
+			std::memcpy(t.voxelLeafNodeArray, leaves.data(), leaves.size() * sizeof(GfxVoxelLeafNode));
+			t.lightListArraySize = static_cast<int>(arr.size());
+			t.lightListArray = mem->allocate<unsigned short>(arr.size());
+			std::memcpy(t.lightListArray, arr.data(), arr.size() * sizeof(unsigned short));
+			t.voxelInternalNodeDynamicLightList = mem->allocate<unsigned int>(2 * internal.size());
+			float zmin[3], zmax[3];
+			for (auto a = 0; a < 3; a++) { zmin[a] = std::min(src.mins[a], h->boundMin[a]); zmax[a] = std::max(src.maxs[a], h->boundMax[a]); }
+			t.zoneBound = make_bounds(zmin, zmax);
+			for (auto v = 1; v < w->voxelTreeCount; v++) w->voxelTree[v] = t;
+			ZONETOOL_INFO("iwzmap: voxel light tree %dx%dx%d roots at %.0f %.0f %.0f: %zu internal nodes, %zu leaves, %zu light lists (%zu entries)",
+				dim[0], dim[1], dim[2], base[0], base[1], base[2], internal.size(), leaves.size(), addresses.size(), arr.size());
+
+			// verification: decode the generated tree with the same reader and check every listed light
+			std::uint64_t ok = 0, total = 0;
+			voxel_visit(t, lay, [&](int leaf, const float* o, float size)
+			{
+				const auto addr = t.voxelLeafNodeArray[leaf].lightListAddress;
+				const auto hdr = t.lightListArray[addr];
+				for (auto q = 0; q < (hdr >> 7) + (hdr & 0x7F); q++)
+				{
+					const auto& l = cw->primaryLights[t.lightListArray[addr + 1 + q]];
+					total++;
+					if (box_touches_sphere(o, size, l.origin, l.radius + 1.0f)) ok++;
+				}
+			});
+			ZONETOOL_INFO("iwzmap: voxel light tree check: %llu / %llu light refs inside the light sphere", ok, total);
 		}
 
 		void build_gfx(GfxWorld* w, GfxWorldTransientZone* tz, const world_source& src, const std::vector<smodel_source>& smodels,
@@ -2053,6 +2414,10 @@ namespace zonetool::iw7::iwzmap
 				build_com_lights(cw, lights);
 				build_gfx(w, tz, src, smodels, slots, map, bsp, mem.get());
 				build_gfx_lights(w, before, cw, lights, src, mem.get());
+				voxel_layout lay;
+				if (const auto* v = std::getenv("IWZ_VOXEL_LAYOUT")) std::sscanf(v, "%d,%d", &lay.column_x_major, &lay.perm);
+				lay.perm = std::clamp(lay.perm, 0, 5);
+				build_voxel_tree(w, cw, lights, src, lay, mem.get());
 				const auto zones = read_lighting(source + "\\lighting.txt", src);
 				if (!zones.empty())
 				{
