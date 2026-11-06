@@ -677,8 +677,22 @@ namespace zonetool::iw7::iwzmap
 				w->skies[i].skyStartSurfs = nullptr;
 			}
 
-			// world brush model 0 covers every surface; no other brush models
-			w->modelCount = 1;
+			// world brush model 0 covers every surface. IWZ_KEEP_SUBMODELS keeps the template brush sub-model slots
+			// (the collision of script_brushmodel entities, e.g. door blockers) without any render surfaces
+			const auto keep_sub = std::getenv("IWZ_KEEP_SUBMODELS") != nullptr;
+			ZONETOOL_INFO("iwzmap: template gfx brush models %u (%s)", w->modelCount, keep_sub ? "kept without surfaces" : "trimmed to the world");
+			if (keep_sub)
+			{
+				for (auto i = 1; i < static_cast<int>(w->modelCount); i++)
+				{
+					w->models[i].startSurfIndex = 0;
+					w->models[i].surfaceCount = 0;
+				}
+			}
+			else
+			{
+				w->modelCount = 1;
+			}
 			w->models[0].bounds = world_bounds;
 			w->models[0].startSurfIndex = slot_mode ? 0 : tpl_count;
 			w->models[0].surfaceCount = static_cast<unsigned short>(own);
@@ -891,12 +905,28 @@ namespace zonetool::iw7::iwzmap
 					i, tm.contents, tm.hullCount, tm.firstHull, tm.windingCount, tm.flags, hb.midPoint[0], hb.midPoint[1], hb.midPoint[2],
 					hb.halfSize[0], hb.halfSize[1], hb.halfSize[2], e->trigger.hulls[tm.firstHull].slabCount);
 			}
-			// one sub-model (the world, *0) to match the single GfxWorld brush model
-			if (e->numSubModels > 1 && !std::getenv("IWZ_KEEP_ENTS"))
+			// one sub-model (the world, *0) to match the single GfxWorld brush model, unless IWZ_KEEP_SUBMODELS keeps the
+			// template sub-models (collision-only script_brushmodels; see build_gfx). Their template nav obstacle index is
+			// kept with the template obstacle hulls (IWZ_SUBMODEL_NAVOBST=keep) or cleared (default: no obstacle).
+			if (e->numSubModels > 1 && !std::getenv("IWZ_KEEP_ENTS") && !std::getenv("IWZ_KEEP_SUBMODELS"))
 			{
 				e->numSubModels = 1;
 			}
-			if (e->numSubModels == 1 && e->cmodels)
+			if (std::getenv("IWZ_KEEP_SUBMODELS") && e->cmodels)
+			{
+				const auto* mode = std::getenv("IWZ_SUBMODEL_NAVOBST");
+				const auto keep_obst = mode && std::string(mode) == "keep";
+				for (auto i = 0u; i < e->numSubModels; i++)
+				{
+					auto& cm = e->cmodels[i];
+					ZONETOOL_INFO("iwzmap: sub-model *%u mid %.1f %.1f %.1f half %.1f %.1f %.1f radius %.1f shape %u navobst %u edge %u info %p physics %s",
+						i, cm.bounds.midPoint[0], cm.bounds.midPoint[1], cm.bounds.midPoint[2], cm.bounds.halfSize[0], cm.bounds.halfSize[1],
+						cm.bounds.halfSize[2], cm.radius, cm.physicsShapeOverrideIdx, cm.navObstacleIdx, cm.edgeFirstIndex,
+						static_cast<void*>(cm.info), cm.physicsAsset && cm.physicsAsset->name ? cm.physicsAsset->name : "-");
+					if (i && !keep_obst) cm.navObstacleIdx = 0xFFFF;
+				}
+			}
+			if (e->cmodels)
 			{
 				e->cmodels[0].bounds = make_bounds(src.mins, src.maxs);
 				e->cmodels[0].radius = std::sqrt(e->cmodels[0].bounds.halfSize[0] * e->cmodels[0].bounds.halfSize[0] +
@@ -1123,8 +1153,22 @@ namespace zonetool::iw7::iwzmap
 			r.pGraphBuffer = mem->allocate<char>(graph.size());
 			std::memcpy(r.pGraphBuffer, graph.data(), graph.size());
 			r.bDockable = false;
-			n->numObstacleBounds = 0;
-			n->obstacleBounds = nullptr;
+			const auto* mode = std::getenv("IWZ_SUBMODEL_NAVOBST");
+			ZONETOOL_INFO("iwzmap: template nav obstacle bounds %d (%s)", n->numObstacleBounds,
+				std::getenv("IWZ_KEEP_SUBMODELS") && mode && std::string(mode) == "keep" ? "kept" : "cleared");
+			for (auto i = 0; i < n->numObstacleBounds && std::getenv("IWZ_KEEP_SUBMODELS"); i++)
+			{
+				const auto& ob = n->obstacleBounds[i];
+				for (auto h = 0; h < ob.m_NumHulls; h++)
+					ZONETOOL_INFO("iwzmap: nav obstacle %d hull %d: %d planes, bounds %.1f %.1f %.1f offset %.1f %.1f %.1f use %d", i, h,
+						ob.m_Hulls[h].m_NumBoundaries, ob.m_Hulls[h].m_BoundsX, ob.m_Hulls[h].m_BoundsY, ob.m_Hulls[h].m_BoundsZ,
+						ob.m_Hulls[h].m_Offset[0], ob.m_Hulls[h].m_Offset[1], ob.m_Hulls[h].m_Offset[2], ob.m_Hulls[h].m_bUseBounds);
+			}
+			if (!(std::getenv("IWZ_KEEP_SUBMODELS") && mode && std::string(mode) == "keep"))
+			{
+				n->numObstacleBounds = 0;
+				n->obstacleBounds = nullptr;
+			}
 			n->numGlassBounds = 0;
 			n->glassBounds = nullptr;
 			n->numModifiers = 0;
