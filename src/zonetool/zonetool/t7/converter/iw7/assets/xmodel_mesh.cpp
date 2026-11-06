@@ -138,7 +138,11 @@ namespace zonetool::t7
 
 							memcpy(&new_surf->verts0.packedVerts0[j].texCoord.packed, &verts[j].UVUPosition, sizeof(int)); // check
 
-							new_surf->verts0.packedVerts0[j].normal.packed = verts[j].VertexNormal;
+							// Same 10:10:10 direction encoding; IW7 sets the two high bits on
+							// every model vertex normal (all 180k vertices of 300 stock cp_zmb
+							// surfaces), BO3 leaves them clear. With them clear a converted
+							// viewmodel renders black.
+							new_surf->verts0.packedVerts0[j].normal.packed = verts[j].VertexNormal | 0xC0000000u;
 							new_surf->verts0.packedVerts0[j].tangent.packed = verts[j].VertexTangent;
 
 							float default_visibility[4] = { 0.0f, 0.0f, 1.0f, 0.0f };
