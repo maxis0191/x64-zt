@@ -626,7 +626,11 @@ namespace zonetool::iw7::iwzmap
 		// - leaf: u16 address into lightListArray; a list is a header (spot count << 7 | omni count) followed by the
 		//   spot then the omni light indices. Address 2 is the empty list.
 		// The column order and the bit -> axis order are verified against the template's light positions
-		// (IWZ_LOG_STATICS: "voxel: hypothesis"); voxel_layout holds the verified one.
+		// (IWZ_LOG_STATICS: "voxel: hypothesis"); voxel_layout holds the verified one: on cp_zmb, x-major columns and
+		// bit fields (x, y, z) put 433021 of 461483 listed light refs inside their light sphere (the stock baker bins a
+		// little wider), y-major 0 and the other bit orders at most 285924.
+		// The light AABB tree (lightAABB) holds exactly the lights with needsDynamicShadows (170 on cp_zmb); the
+		// generated lights have it off, so it is left as is.
 		struct voxel_layout
 		{
 			int column_x_major = 1; // top-down index = x + y * dimX
