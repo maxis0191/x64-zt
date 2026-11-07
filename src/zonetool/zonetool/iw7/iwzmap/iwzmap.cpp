@@ -1194,7 +1194,8 @@ namespace zonetool::iw7::iwzmap
 				for (auto a = 0; a < 3; a++) sinst.lightingOrigin[a] = sinst.bounds.midPoint[a];
 				// stock lodData: a distinct slot per instance (0..lodData[count]-1, one duplicate 0), like a filled
 				// runtime cache; the generated world gives instance i slot i and lodData[count] = count
-				// (IWZ_SMODEL_LOD=zero: all 0)
+				// (IWZ_SMODEL_LOD=zero: all 0). Engine-tested: with all-zero lodData and template unk9 values no generated
+				// static model was drawn; with slots + unk9 rank they render (iwz-stage2/smodels run-a-2 vs run-a-3).
 				lod[i] = lod_index ? i : 0;
 				sorted[i] = static_cast<unsigned short>(i);
 			}
