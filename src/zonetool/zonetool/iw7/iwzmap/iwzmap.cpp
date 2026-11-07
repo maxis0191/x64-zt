@@ -883,6 +883,54 @@ namespace zonetool::iw7::iwzmap
 				for (auto pos = ents.find(tag); pos != std::string::npos; pos = ents.find(tag, pos + real.size()))
 					ents.replace(pos, tag.size(), real);
 			}
+			// IWZ_TRIGGER_SHAPES: script volume tests (ispointinvolume / istouching) use the trigger model's entity physics
+			// shape, which generated models lack. Give each generated model the shape of an unused single-hull template box
+			// trigger (unique box size in the entity shape data) and resize that box (its half extents are stored / 32,
+			// three times per box shape) to the generated hull.
+			if (std::getenv("IWZ_TRIGGER_SHAPES") && e->havokEntsShapeData && e->havokEntsShapeDataSize)
+			{
+				auto* blob = reinterpret_cast<unsigned char*>(e->havokEntsShapeData);
+				const auto size = static_cast<size_t>(e->havokEntsShapeDataSize);
+				auto find_all = [&](const float* v) {
+					std::vector<size_t> at;
+					for (size_t o = 0; o + 12 <= size; o += 4)
+					{
+						float f[3];
+						std::memcpy(f, blob + o, 12);
+						if (std::fabs(f[0] - v[0]) < 1e-3f && std::fabs(f[1] - v[1]) < 1e-3f && std::fabs(f[2] - v[2]) < 1e-3f) at.push_back(o);
+					}
+					return at;
+				};
+				std::vector<std::pair<float, unsigned int>> donors;
+				for (auto m = 0u; m < base; m++)
+				{
+					const auto& tm = models[m];
+					if (tm.hullCount != 1 || tm.contents != 0x28000001) continue;
+					const auto& b = hulls[tm.firstHull].bounds;
+					if (b.midPoint[0] != 0.0f || b.midPoint[1] != 0.0f || b.midPoint[2] != 0.0f) continue;
+					const float v[3] = {b.halfSize[0] / 32.0f, b.halfSize[1] / 32.0f, b.halfSize[2] / 32.0f};
+					if (find_all(v).size() != 3) continue;
+					donors.emplace_back(-(b.halfSize[0] * b.halfSize[1] * b.halfSize[2]), m);
+				}
+				std::sort(donors.begin(), donors.end());
+				for (auto k = 0u; k < list.size() && k < donors.size(); k++)
+				{
+					const auto d = donors[k].second;
+					auto& tm = models[base + k];
+					const auto& db = hulls[models[d].firstHull].bounds;
+					const float from[3] = {db.halfSize[0] / 32.0f, db.halfSize[1] / 32.0f, db.halfSize[2] / 32.0f};
+					const auto& g = hulls[tm.firstHull].bounds;
+					const float to[3] = {g.halfSize[0] / 32.0f, g.halfSize[1] / 32.0f, g.halfSize[2] / 32.0f};
+					const auto at = find_all(from);
+					for (const auto o : at) std::memcpy(blob + o, to, 12);
+					tm.physicsAsset = models[d].physicsAsset;
+					tm.physicsShapeOverrideIdx = models[d].physicsShapeOverrideIdx;
+					tm.flags = models[d].flags;
+					ZONETOOL_INFO("iwzmap: generated trigger ?%u takes the entity shape of template ?%u (shape %u, half %.0f %.0f %.0f -> %.0f %.0f %.0f, %zu patches)",
+						base + k, d, tm.physicsShapeOverrideIdx, db.halfSize[0], db.halfSize[1], db.halfSize[2], g.halfSize[0], g.halfSize[1], g.halfSize[2], at.size());
+				}
+				if (donors.size() < list.size()) ZONETOOL_WARNING("iwzmap: only %zu template box shapes for %zu generated triggers", donors.size(), list.size());
+			}
 			e->trigger.models = models;
 			e->trigger.count = base + static_cast<unsigned int>(list.size());
 			e->trigger.hulls = hulls;
