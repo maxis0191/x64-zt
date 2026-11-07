@@ -1,6 +1,7 @@
 #include <std_include.hpp>
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
+#include "iwzmap_volumes.hpp"
 
 #include <array>
 #include <cmath>
@@ -878,7 +879,9 @@ namespace zonetool::iw7::iwzmap
 		void build_ents(MapEnts* e, const std::string& bsp, std::string ents, const std::string& triggers, const std::string& relocations,
 			map_ents* strings, const world_source& src, zone_memory* mem)
 		{
+			const auto template_triggers = e->trigger.count;
 			add_triggers(e, triggers, ents, mem);
+			assign_volume_shapes(e, template_triggers, ents, mem); // iwzmap_volumes.cpp: entity shapes of generated triggers
 			ZONETOOL_INFO("template triggers: %u models %u hulls %u slabs %u windings; client %u models", e->trigger.count,
 				e->trigger.hullCount, e->trigger.slabCount, e->trigger.windingCount, e->clientTrigger.trigger.count);
 			for (auto i = 0u; i < e->trigger.count; i++)
