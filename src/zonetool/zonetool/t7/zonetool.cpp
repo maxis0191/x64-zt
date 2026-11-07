@@ -28,6 +28,11 @@ namespace zonetool::t7
 	std::FILE* asset_log = nullptr;
 	std::mutex asset_log_mutex;
 	std::atomic_bool zone_finished{ false };
+	// -holdzone: the release file, when the hold is pending. A map zone runs its world setup
+	// when its fastfile finishes loading, which ended the process before the main thread could
+	// announce the hold (zm_prototype); the hold therefore happens in the finish hook itself,
+	// with every asset registered and before the original finish runs.
+	std::string hold_release;
 
 	void log_asset_address(const XAssetType type, const XAssetHeader header)
 	{
@@ -397,6 +402,30 @@ namespace zonetool::t7
 		if (ff_name == filesystem::get_fastfile())
 		{
 			stop_dumping();
+			if (!hold_release.empty())
+			{
+				if (asset_log)
+				{
+					std::lock_guard _(asset_log_mutex);
+					std::fflush(asset_log);
+				}
+
+				ZONETOOL_INFO("ZONETOOL_HOLD %s %lu", ff_name, GetCurrentProcessId());
+				std::fflush(stdout);
+				while (!utils::io::file_exists(hold_release))
+				{
+					Sleep(100);
+				}
+
+				if (asset_log)
+				{
+					std::fclose(asset_log);
+					asset_log = nullptr;
+				}
+
+				// Released: the readers are done; the world setup of a map zone is not needed.
+				std::quick_exit(EXIT_SUCCESS);
+			}
 			zone_finished = true;
 		}
 		
@@ -833,25 +862,17 @@ namespace zonetool::t7
 						wait_for_database();
 						filesystem::set_fastfile(zone);
 						zone_finished = false;
+						hold_release = release;
 						if (load_zone(zone, false, true))
 						{
-							while (!zone_finished)
+							// The finish hook holds the zone and exits once released.
+							while (true)
 							{
-								Sleep(5);
+								Sleep(100);
 							}
 						}
 
-						if (asset_log)
-						{
-							std::fflush(asset_log);
-						}
-
-						ZONETOOL_INFO("ZONETOOL_HOLD %s %lu", zone.data(), GetCurrentProcessId());
-						std::fflush(stdout);
-						while (!utils::io::file_exists(release))
-						{
-							Sleep(100);
-						}
+						hold_release.clear();
 						i += 2;
 					}
 				}
@@ -867,8 +888,34 @@ namespace zonetool::t7
 		}
 	}
 
+	void hold_until_released(const char* zone)
+	{
+		if (hold_release.empty())
+		{
+			return;
+		}
+
+		const auto release = hold_release;
+		hold_release.clear();
+		if (asset_log)
+		{
+			std::lock_guard _(asset_log_mutex);
+			std::fflush(asset_log);
+		}
+
+		ZONETOOL_INFO("ZONETOOL_HOLD %s %lu", zone, GetCurrentProcessId());
+		std::fflush(stdout);
+		while (!utils::io::file_exists(release))
+		{
+			Sleep(100);
+		}
+	}
+
 	void on_exit(void)
 	{
+		// A map zone (zm_prototype) ends the process from its own post-load setup, before the
+		// load-finished hook: the hold then happens here, the assets still resident.
+		hold_until_released(filesystem::get_fastfile().data());
 		globals.verify = false;
 		globals.dump = false;
 		globals.dump_csv = false;
@@ -927,6 +974,7 @@ namespace zonetool::t7
 
 		//doexit_hook.create(, doexit);
 		atexit(on_exit);
+		at_quick_exit(on_exit);
 
 		utils::hook::nop(0x1401D87AE, 5); // nop original "loadzone" command
 
