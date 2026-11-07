@@ -77,9 +77,9 @@ namespace zonetool::iw7::iwzmap
 					names[static_cast<std::uint32_t>(p + 5 - cn.start)] = std::string(s, n);
 					p += 5 + n + 1;
 				}
-				const auto& ds = secs[csec];
-				st = ds.start;
-				data_size = ds.local;
+				const auto& dsec = secs[csec];
+				st = dsec.start;
+				data_size = dsec.local;
 				contents = static_cast<std::uint32_t>(coff);
 				auto read = [&](std::uint32_t from, std::uint32_t to, std::uint32_t stride, auto&& fn) {
 					for (std::size_t o = st + from; o + stride <= st + to; o += stride)
@@ -89,9 +89,9 @@ namespace zonetool::iw7::iwzmap
 						if (v[0] != -1) fn(v);
 					}
 				};
-				read(ds.local, ds.glob, 8, [&](const std::int32_t* v) { local[v[0]] = v[1]; });
-				read(ds.glob, ds.virt, 12, [&](const std::int32_t* v) { if (v[1] == csec) global[v[0]] = v[2]; });
-				read(ds.virt, ds.exp, 12, [&](const std::int32_t* v) {
+				read(dsec.local, dsec.glob, 8, [&](const std::int32_t* v) { local[v[0]] = v[1]; });
+				read(dsec.glob, dsec.virt, 12, [&](const std::int32_t* v) { if (v[1] == csec) global[v[0]] = v[2]; });
+				read(dsec.virt, dsec.exp, 12, [&](const std::int32_t* v) {
 					const auto it = names.find(v[2]);
 					classes[v[0]] = it == names.end() ? "?" : it->second;
 				});
@@ -122,7 +122,7 @@ namespace zonetool::iw7::iwzmap
 			std::array<float, 3> half{};       // shape space
 		};
 
-		bool near(float a, float b) { return std::fabs(a - b) <= shape_tol * std::max(1.0f, std::fabs(b)); }
+		bool close_to(float a, float b) { return std::fabs(a - b) <= shape_tol * std::max(1.0f, std::fabs(b)); }
 
 		bool decode_box(const packfile& pk, std::int64_t shape, box_shape* out, std::string* why)
 		{
@@ -153,7 +153,7 @@ namespace zonetool::iw7::iwzmap
 				for (auto a = 0; a < 3; a++) b.half[a] = std::max(b.half[a], std::fabs(pk.f(b.verts + 16 * i)[a]));
 			for (auto i = 0; i < 8; i++)
 				for (auto a = 0; a < 3; a++)
-					if (!near(std::fabs(pk.f(b.verts + 16 * i)[a]), b.half[a])) { *why = "vertices are not one box"; return false; }
+					if (!close_to(std::fabs(pk.f(b.verts + 16 * i)[a]), b.half[a])) { *why = "vertices are not one box"; return false; }
 			for (auto i = 0; i < 6; i++)
 			{
 				const auto* p = pk.f(b.planes + 16 * i);
@@ -161,14 +161,14 @@ namespace zonetool::iw7::iwzmap
 				for (auto a = 0; a < 3; a++)
 					if (std::fabs(std::fabs(p[a]) - 1.0f) < 1e-4f) { axis = a; axes++; }
 					else if (std::fabs(p[a]) > 1e-4f) axes = 9;
-				if (axes != 1 || !near(-p[3], b.half[axis])) { *why = "planes are not the box faces"; return false; }
+				if (axes != 1 || !close_to(-p[3], b.half[axis])) { *why = "planes are not the box faces"; return false; }
 			}
 			auto is_box_bounds = [&](std::uint32_t at) {
 				const auto* lo = pk.f(at);
 				const auto* hi = pk.f(at + 16);
 				if (!lo || !hi) return false;
 				for (auto a = 0; a < 3; a++)
-					if (!near(lo[a], -b.half[a]) || !near(hi[a], b.half[a])) return false;
+					if (!close_to(lo[a], -b.half[a]) || !close_to(hi[a], b.half[a])) return false;
 				return true;
 			};
 			if (!is_box_bounds(b.compound + 0x80)) { *why = "compound aabb is not the box"; return false; }
@@ -303,8 +303,8 @@ namespace zonetool::iw7::iwzmap
 			write_box(pk, dn.box, half);
 			box_shape check{};
 			std::string why;
-			const auto ok = decode_box(pk, shapes[dm.physicsShapeOverrideIdx], &check, &why) && near(check.half[0], half[0]) &&
-				near(check.half[1], half[1]) && near(check.half[2], half[2]);
+			const auto ok = decode_box(pk, shapes[dm.physicsShapeOverrideIdx], &check, &why) && close_to(check.half[0], half[0]) &&
+				close_to(check.half[1], half[1]) && close_to(check.half[2], half[2]);
 			if (!ok)
 			{
 				ZONETOOL_ERROR("iwzmap: generated trigger ?%u: rewritten shape %u does not verify (%s)", k, dm.physicsShapeOverrideIdx, why.data());
