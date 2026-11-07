@@ -231,6 +231,11 @@ namespace zonetool::iw7::iwzmap
 		// Static models (smodels.txt): "<xmodel> x y z pitch yaw roll scale [noshadow] [nocollision] [cull=<units>]"
 		// ('#' starts a comment). Each line becomes a GfxWorld static model (light grid lit), an Umbra object
 		// (class 1) and, when the model has a collision shape, a clipmap static model.
+		// The XModel must be in the template dump (its own zone content). Engine-tested (iwz-stage2/smodels runs 3):
+		// the clipmap static model blocks bullet traces only; physicstrace, playerphysicstrace, player movement (and
+		// so AI) go through it, as for stock props, whose player blocking comes from clip geometry. The generator adds
+		// that clip to the world Havok mesh and cuts the navmesh from smodels.bounds.json (written next to the
+		// sources by every compile, or by -iwzbounds).
 		struct smodel_source
 		{
 			std::string model;
@@ -369,6 +374,9 @@ namespace zonetool::iw7::iwzmap
 		// "spot x y z r g b intensity radius pitch yaw fov [shadow]" ('#' comment). The light colour is rgb * intensity
 		// (stock IW7 lights store radiance this way; stock values are in the thousands). Each light takes the place of
 		// a static template light of the same kind (its arrays stay coherent), moved and re-shaped to the new light.
+		// cp_zmb offers about 860 static spot and 140 static omni slots. Lights reach shading through their class-4
+		// tome object and the regenerated static light voxel tree (build_voxel_tree). "shadow" picks a
+		// shadow-capable slot and lists shadow casters (surfaces/static models in the sphere): not engine-verified.
 		struct light_source
 		{
 			bool spot = false;
