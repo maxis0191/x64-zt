@@ -888,8 +888,34 @@ namespace zonetool::t7
 		}
 	}
 
+	void hold_until_released(const char* zone)
+	{
+		if (hold_release.empty())
+		{
+			return;
+		}
+
+		const auto release = hold_release;
+		hold_release.clear();
+		if (asset_log)
+		{
+			std::lock_guard _(asset_log_mutex);
+			std::fflush(asset_log);
+		}
+
+		ZONETOOL_INFO("ZONETOOL_HOLD %s %lu", zone, GetCurrentProcessId());
+		std::fflush(stdout);
+		while (!utils::io::file_exists(release))
+		{
+			Sleep(100);
+		}
+	}
+
 	void on_exit(void)
 	{
+		// A map zone (zm_prototype) ends the process from its own post-load setup, before the
+		// load-finished hook: the hold then happens here, the assets still resident.
+		hold_until_released(filesystem::get_fastfile().data());
 		globals.verify = false;
 		globals.dump = false;
 		globals.dump_csv = false;
@@ -948,6 +974,7 @@ namespace zonetool::t7
 
 		//doexit_hook.create(, doexit);
 		atexit(on_exit);
+		at_quick_exit(on_exit);
 
 		utils::hook::nop(0x1401D87AE, 5); // nop original "loadzone" command
 
