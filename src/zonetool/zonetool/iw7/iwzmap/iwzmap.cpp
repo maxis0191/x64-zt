@@ -839,6 +839,31 @@ namespace zonetool::iw7::iwzmap
 					scratch.free();
 				}
 			}
+			// full table of the template static models for offline analysis (IWZ_DUMP_SMODELS=<csv path>)
+			if (const auto* path = std::getenv("IWZ_DUMP_SMODELS"))
+			{
+				std::vector<unsigned> pos(d.smodelCount);
+				if (d.sortedSmodelIndices) for (auto k = 0u; k < d.smodelCount; k++) pos[d.sortedSmodelIndices[k]] = k;
+				std::ostringstream o;
+				o << "i,model,x,y,z,scale,flags,cull,lod,sortedPos,unk0,unk1,unk2,unk3,handle,unk5,unk9,unk10,unk11,unk13,unk14,unk15,env,probe,skin,sun,tz,unk21,lmIdx,nLV,numLods,numsurfs,radius\n";
+				for (auto i = 0u; i < d.smodelCount; i++)
+				{
+					const auto& tdi = d.smodelDrawInsts[i];
+					std::uint32_t u15;
+					std::memcpy(&u15, tdi.unk15, 4);
+					const auto* m = tdi.model;
+					o << i << "," << (m && m->name ? m->name : "-") << "," << tdi.placement.origin[0] << "," << tdi.placement.origin[1] << "," << tdi.placement.origin[2] << ","
+						<< tdi.placement.scale << "," << tdi.flags << "," << tdi.cullDist << "," << (d.lodData ? d.lodData[i] : 0) << "," << pos[i] << "," << tdi.unk0 << "," << tdi.unk1
+						<< "," << tdi.unk2 << "," << tdi.unk3 << "," << tdi.lightingHandle << "," << tdi.unk5 << "," << tdi.unk9 << "," << tdi.unk10 << "," << tdi.unk11 << ","
+						<< static_cast<int>(tdi.unk13) << "," << static_cast<int>(tdi.unk14) << "," << u15 << "," << tdi.primaryLightEnvIndex << "," << static_cast<int>(tdi.reflectionProbeIndex)
+						<< "," << static_cast<int>(tdi.firstMtlSkinIndex) << "," << static_cast<int>(tdi.sunShadowFlags) << "," << static_cast<int>(tdi.transientZone) << ","
+						<< static_cast<int>(tdi.unk21) << "," << tdi.modelLightmapInfo.lightmapIndex << "," << tdi.vertexLightingInfo.numLightingValues << ","
+						<< (m ? static_cast<int>(m->numLods) : -1) << "," << (m ? static_cast<int>(m->numsurfs) : -1) << "," << (m ? m->radius : 0.0f) << "\n";
+				}
+				o << "lodData[count]," << (d.lodData ? d.lodData[d.smodelCount] : 0) << "\n";
+				utils::io::write_file(path, o.str());
+				ZONETOOL_INFO("statics: wrote %u static model rows to %s", d.smodelCount, path);
+			}
 			// aabb tree smodel lists
 			if (tz && tz->aabbTrees)
 			{
@@ -864,6 +889,18 @@ namespace zonetool::iw7::iwzmap
 				flag_bytes[hex_bytes(&m.unk1, 4) + " pad " + std::to_string(m.pad)]++;
 			}
 			for (const auto& [f, n] : flag_bytes) ZONETOOL_INFO("statics: clip model flag bytes %s x%u", f.data(), n);
+			{
+				std::map<std::string, std::pair<unsigned, unsigned>> per_model;
+				for (auto k = 0u; k < c->numStaticModels; k++)
+				{
+					const auto& m = c->staticModelList[k];
+					auto& e = per_model[m.xmodel && m.xmodel->name ? m.xmodel->name : "-"];
+					(m.unk1 ? e.second : e.first)++;
+				}
+				std::string flagged;
+				for (const auto& [name, e] : per_model) if (e.second) flagged += name + ":" + std::to_string(e.second) + "/" + std::to_string(e.first + e.second) + " ";
+				ZONETOOL_INFO("statics: clip models with unk1 set: %s", flagged.data());
+			}
 			for (const auto k : {0u, 1u, 2u, 100u, 1000u})
 			{
 				if (k >= c->numStaticModels) continue;
@@ -1102,6 +1139,10 @@ namespace zonetool::iw7::iwzmap
 			std::unordered_map<std::string, XModel*> stubs;
 			auto copied = 0u;
 			auto range_end = 0u;
+			const auto* unk_mode = std::getenv("IWZ_SMODEL_UNK");
+			const bool zero_unk = unk_mode && std::string(unk_mode) == "zero";
+			const auto* lod_mode = std::getenv("IWZ_SMODEL_LOD");
+			const bool lod_index = !(lod_mode && std::string(lod_mode) == "zero");
 			for (auto i = 0u; i < n; i++)
 			{
 				const auto& s = list[i];
@@ -1122,6 +1163,19 @@ namespace zonetool::iw7::iwzmap
 				dinst.unk0 = static_cast<unsigned short>(range_end & 0xFFFF);
 				dinst.unk1 = static_cast<unsigned short>(range_end >> 16);
 				range_end += dinst.unk3;
+				// unk9: 1 + rank of the instance in (unk1:unk0) order (verified on all 17010 cp_zmb instances)
+				dinst.unk9 = static_cast<unsigned short>(i + 1);
+				if (zero_unk)
+				{
+					// like the H1 -> IW7 converter: every unnamed field zero
+					dinst.unk0 = dinst.unk1 = dinst.unk2 = dinst.unk3 = 0;
+					dinst.unk5 = 0;
+					std::memset(dinst.unk6, 0, sizeof(dinst.unk6));
+					dinst.unk9 = dinst.unk10 = dinst.unk11 = 0;
+					dinst.unk13 = dinst.unk14 = 0;
+					std::memset(dinst.unk15, 0, sizeof(dinst.unk15));
+					dinst.unk21 = 0;
+				}
 				if (!stubs.contains(s.model)) stubs[s.model] = name_stub<XModel>(mem, s.model);
 				dinst.model = stubs[s.model];
 				std::memset(&dinst.vertexLightingInfo, 0, sizeof(dinst.vertexLightingInfo));
@@ -1138,10 +1192,13 @@ namespace zonetool::iw7::iwzmap
 				auto& sinst = insts[i];
 				sinst.bounds = make_bounds(s.mins, s.maxs);
 				for (auto a = 0; a < 3; a++) sinst.lightingOrigin[a] = sinst.bounds.midPoint[a];
-				lod[i] = 0; // stock values are unique per instance with no relation to the other fields: runtime-like, start at 0
+				// stock lodData: a distinct slot per instance (0..lodData[count]-1, one duplicate 0), like a filled
+				// runtime cache; the generated world gives instance i slot i and lodData[count] = count
+				// (IWZ_SMODEL_LOD=zero: all 0)
+				lod[i] = lod_index ? i : 0;
 				sorted[i] = static_cast<unsigned short>(i);
 			}
-			lod[n] = 0;
+			lod[n] = lod_index ? n : 0;
 			// consecutive draws of one model (instanced batches)
 			std::stable_sort(sorted, sorted + n, [&](unsigned short a, unsigned short b) { return list[a].model < list[b].model; });
 
@@ -1955,6 +2012,8 @@ namespace zonetool::iw7::iwzmap
 				m.xmodel = stubs[s.model];
 				m.hasTransientModel = false;
 				m.hasTransientPhysicsAsset = false;
+				if (const auto* f = std::getenv("IWZ_CLIP_UNK1")) m.unk1 = std::atoi(f) != 0; // flag-byte experiments
+				if (const auto* f = std::getenv("IWZ_CLIP_UNK2")) m.unk2 = std::atoi(f) != 0;
 				for (auto a = 0; a < 3; a++)
 				{
 					m.origin[a] = s.origin[a];
