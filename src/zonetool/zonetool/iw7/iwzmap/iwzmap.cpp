@@ -1,7 +1,6 @@
 #include <std_include.hpp>
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
-#include "iwzmap_volumes.hpp"
 
 #include <array>
 #include <cmath>
@@ -20,6 +19,8 @@
 #include "zonetool/iw7/assets/fxworld.hpp"
 
 #include <utils/io.hpp>
+
+#include "iwzmap_volumes.hpp"
 
 // IW7 map compiler ("iwzmap").
 //
