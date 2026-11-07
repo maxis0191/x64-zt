@@ -905,17 +905,39 @@ namespace zonetool::iw7::iwzmap
 				for (auto m = 0u; m < base; m++)
 				{
 					const auto& tm = models[m];
-					if (tm.hullCount != 1 || tm.contents != 0x28000001) continue;
+					if (tm.hullCount != 1 || (tm.contents & 0xFF000000) != 0x28000000) continue;
 					const auto& b = hulls[tm.firstHull].bounds;
 					if (b.midPoint[0] != 0.0f || b.midPoint[1] != 0.0f || b.midPoint[2] != 0.0f) continue;
 					const float v[3] = {b.halfSize[0] / 32.0f, b.halfSize[1] / 32.0f, b.halfSize[2] / 32.0f};
 					if (find_all(v).size() != 3) continue;
 					donors.emplace_back(-(b.halfSize[0] * b.halfSize[1] * b.halfSize[2]), m);
 				}
+				// the engine keeps a broadphase box of the donor's original size (engine run g8: points beyond it fail), so
+				// each generated volume takes the smallest unused donor that covers it on every axis, largest volumes first
 				std::sort(donors.begin(), donors.end());
-				for (auto k = 0u; k < list.size() && k < donors.size(); k++)
+				std::vector<unsigned int> order(list.size());
+				for (auto k = 0u; k < list.size(); k++) order[k] = k;
+				std::sort(order.begin(), order.end(), [&](unsigned int a, unsigned int b) {
+					const auto& ha = hulls[models[base + a].firstHull].bounds.halfSize;
+					const auto& hb = hulls[models[base + b].firstHull].bounds.halfSize;
+					return std::max({ha[0], ha[1], ha[2]}) > std::max({hb[0], hb[1], hb[2]});
+				});
+				std::vector<bool> taken(donors.size(), false);
+				for (const auto k : order)
 				{
-					const auto d = donors[k].second;
+					const auto& gen_half = hulls[models[base + k].firstHull].bounds.halfSize;
+					auto pick = -1;
+					for (auto i = static_cast<int>(donors.size()) - 1; i >= 0; i--)     // ascending volume
+					{
+						if (taken[i]) continue;
+						const auto& donor_half = hulls[models[donors[i].second].firstHull].bounds.halfSize;
+						if (donor_half[0] >= gen_half[0] && donor_half[1] >= gen_half[1] && donor_half[2] >= gen_half[2]) { pick = i; break; }
+					}
+					if (pick < 0)
+						for (auto i = 0; i < static_cast<int>(donors.size()); i++) if (!taken[i]) { pick = i; break; }
+					if (pick < 0) break;
+					taken[pick] = true;
+					const auto d = donors[pick].second;
 					auto& tm = models[base + k];
 					const auto& db = hulls[models[d].firstHull].bounds;
 					const float from[3] = {db.halfSize[0] / 32.0f, db.halfSize[1] / 32.0f, db.halfSize[2] / 32.0f};
