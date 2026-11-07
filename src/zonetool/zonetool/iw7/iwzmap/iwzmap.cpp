@@ -377,7 +377,9 @@ namespace zonetool::iw7::iwzmap
 				if (kind == "ambient")
 				{
 					l >> z.rgb[0] >> z.rgb[1] >> z.rgb[2] >> z.up;
-					for (auto a = 0; a < 3; a++) { z.mins[a] = src.mins[a] - 512.0f; z.maxs[a] = src.maxs[a] + 512.0f; }
+					// every template probe: tetrahedra around the generated rooms may reach far outside them
+					const auto margin = std::getenv("IWZ_AMBIENT_NEAR_ONLY") ? 512.0f : 1.0e7f;
+					for (auto a = 0; a < 3; a++) { z.mins[a] = src.mins[a] - margin; z.maxs[a] = src.maxs[a] + margin; }
 				}
 				else if (kind == "room")
 				{
@@ -1390,6 +1392,24 @@ namespace zonetool::iw7::iwzmap
 					const auto a = relight_probes(grid.probePositions, grid.probes, grid.probeCount, zones);
 					const auto b = relight_probes(grid.gpuVisibleProbePositions, grid.gpuVisibleProbesData, grid.gpuVisibleProbesCount, zones);
 					ZONETOOL_INFO("iwzmap: relit %u light grid probes (%u gpu visible) from %zu lighting zones", a, b, zones.size());
+					// points outside the template's probe tetrahedra (the generated rooms lie where the template has no
+					// probes) take their light grid zone's fallback probe: give every fallback the generated ambient
+					// (first lighting line) instead of the template's value (engine runs g2..g11: script models dark)
+					for (auto zi = 0u; zi < grid.zoneCount && grid.zones; zi++)
+					{
+						auto& fb = grid.zones[zi].fallbackProbeData;
+						ZONETOOL_INFO("iwzmap: light grid zone %u: %u probes, %u tetrahedrons, fallback c0 %.3f %.3f %.3f -> %.3f %.3f %.3f", zi,
+							grid.zones[zi].numProbes, grid.zones[zi].numTetrahedrons, half_to_float(fb.coeffs[0]), half_to_float(fb.coeffs[9]),
+							half_to_float(fb.coeffs[18]), zones[0].rgb[0], zones[0].rgb[1], zones[0].rgb[2]);
+						if (std::getenv("IWZ_KEEP_FALLBACK_PROBE")) continue;
+						for (auto ch = 0; ch < 3; ch++)
+						{
+							for (auto k = 0; k < 9; k++) fb.coeffs[ch * 9 + k] = 0;
+							fb.coeffs[ch * 9 + 0] = float_to_half(zones[0].rgb[ch]);
+							fb.coeffs[ch * 9 + 2] = float_to_half(zones[0].rgb[ch] * zones[0].up);
+						}
+						fb.coeffs[27] = float_to_half(1.0f);
+					}
 				}
 			}
 			build_clip(c, bsp, hkx, mem.get());
