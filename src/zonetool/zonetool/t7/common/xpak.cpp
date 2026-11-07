@@ -163,7 +163,9 @@ namespace zonetool::t7
 						}
 						default:
 						{
-							data_ptr = data_end; // idk why this shit is so fucked
+							// Blocks that carry no mesh/image bytes (flags other than raw and LZ4, e.g. 0xCF)
+							// are skipped. Ending the stream here truncated every later block: Ray Gun
+							// Mark II and DLC meshes stopped at whole pages (393024 of 488864 bytes).
 							break;
 						}
 						}
@@ -173,7 +175,9 @@ namespace zonetool::t7
 						write(buffer.data(), buffer.size());
 					}
 
-					//data_ptr = align_value(data_ptr, 0x80);
+					// The next page header starts at the next 0x80 boundary of the entry's data.
+					const auto offset = static_cast<size_t>(data_ptr - reinterpret_cast<const char*>(data));
+					data_ptr = reinterpret_cast<const char*>(data) + align_value(offset, 0x80);
 				}
 
 				return out_buffer;
@@ -281,10 +285,12 @@ namespace zonetool::t7
 
 			std::vector<std::uint8_t> get_data(uint64_t key, const unsigned int expected_size)
 			{
+				auto found = false;
 				for (auto& map : xpak_cache_map)
 				{
 					if (map.second.contains(key))
 					{
+						found = true;
 						auto obj = map.second[key];
 						filesystem::file file(obj.PackageFile);
 						file.open("rb", false, false);
@@ -304,7 +310,16 @@ namespace zonetool::t7
 						{
 							return data;
 						}
+
+						ZONETOOL_ERROR("xpak key %016llX in %s: %zu bytes after decompression, %u expected (stored %llu)",
+							key, obj.PackageFile.data(), data.size(), expected_size, obj.CompressedSize);
 					}
+				}
+
+				if (!found)
+				{
+					ZONETOOL_ERROR("xpak key %016llX (%u bytes) is in none of the %zu xpaks indexed", key, expected_size,
+						xpak_cache_map.size());
 				}
 
 				return {};
