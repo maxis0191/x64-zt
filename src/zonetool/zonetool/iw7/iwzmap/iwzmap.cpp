@@ -910,6 +910,8 @@ namespace zonetool::iw7::iwzmap
 					if (b.midPoint[0] != 0.0f || b.midPoint[1] != 0.0f || b.midPoint[2] != 0.0f) continue;
 					const float v[3] = {b.halfSize[0] / 32.0f, b.halfSize[1] / 32.0f, b.halfSize[2] / 32.0f};
 					if (find_all(v).size() != 3) continue;
+					// axes must differ so each float of the shape maps to one axis
+					if (std::fabs(v[0] - v[1]) < 1e-2f || std::fabs(v[0] - v[2]) < 1e-2f || std::fabs(v[1] - v[2]) < 1e-2f) continue;
 					donors.emplace_back(-(b.halfSize[0] * b.halfSize[1] * b.halfSize[2]), m);
 				}
 				// the engine keeps a broadphase box of the donor's original size (engine run g8: points beyond it fail), so
@@ -943,13 +945,34 @@ namespace zonetool::iw7::iwzmap
 					const float from[3] = {db.halfSize[0] / 32.0f, db.halfSize[1] / 32.0f, db.halfSize[2] / 32.0f};
 					const auto& g = hulls[tm.firstHull].bounds;
 					const float to[3] = {g.halfSize[0] / 32.0f, g.halfSize[1] / 32.0f, g.halfSize[2] / 32.0f};
+					// the donor is a convex box: AABB min/max (twice), 8 vertices (+-x, +-y, +-z) and 6 planes (n, -d), all
+					// between the first and last max triplet: rescale every float of the region whose magnitude is a half extent
 					const auto at = find_all(from);
-					for (const auto o : at) std::memcpy(blob + o, to, 12);
+					auto patched = 0u;
+					if (!at.empty())
+					{
+						const auto r0 = at.front() >= 16 ? at.front() - 16 : 0, r1 = std::min(size, at.back() + 16);
+						for (auto o = r0; o + 4 <= r1; o += 4)
+						{
+							float f;
+							std::memcpy(&f, blob + o, 4);
+							for (auto a = 0; a < 3; a++)
+							{
+								if (std::fabs(std::fabs(f) - from[a]) < 1e-3f)
+								{
+									const auto g2 = f < 0 ? -to[a] : to[a];
+									std::memcpy(blob + o, &g2, 4);
+									patched++;
+									break;
+								}
+							}
+						}
+					}
 					tm.physicsAsset = models[d].physicsAsset;
 					tm.physicsShapeOverrideIdx = models[d].physicsShapeOverrideIdx;
 					tm.flags = models[d].flags;
-					ZONETOOL_INFO("iwzmap: generated trigger ?%u takes the entity shape of template ?%u (shape %u, half %.0f %.0f %.0f -> %.0f %.0f %.0f, %zu patches)",
-						base + k, d, tm.physicsShapeOverrideIdx, db.halfSize[0], db.halfSize[1], db.halfSize[2], g.halfSize[0], g.halfSize[1], g.halfSize[2], at.size());
+					ZONETOOL_INFO("iwzmap: generated trigger ?%u takes the entity shape of template ?%u (shape %u, half %.0f %.0f %.0f -> %.0f %.0f %.0f, %u floats)",
+						base + k, d, tm.physicsShapeOverrideIdx, db.halfSize[0], db.halfSize[1], db.halfSize[2], g.halfSize[0], g.halfSize[1], g.halfSize[2], patched);
 				}
 				if (donors.size() < list.size()) ZONETOOL_WARNING("iwzmap: only %zu template box shapes for %zu generated triggers", donors.size(), list.size());
 			}
