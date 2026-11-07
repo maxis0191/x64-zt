@@ -1402,11 +1402,11 @@ namespace zonetool::iw7::iwzmap
 							grid.zones[zi].numProbes, grid.zones[zi].numTetrahedrons, half_to_float(fb.coeffs[0]), half_to_float(fb.coeffs[9]),
 							half_to_float(fb.coeffs[18]), zones[0].rgb[0], zones[0].rgb[1], zones[0].rgb[2]);
 						if (std::getenv("IWZ_KEEP_FALLBACK_PROBE")) continue;
-						for (auto ch = 0; ch < 3; ch++)
+						for (auto chan_i = 0; chan_i < 3; chan_i++)
 						{
-							for (auto k = 0; k < 9; k++) fb.coeffs[ch * 9 + k] = 0;
-							fb.coeffs[ch * 9 + 0] = float_to_half(zones[0].rgb[ch]);
-							fb.coeffs[ch * 9 + 2] = float_to_half(zones[0].rgb[ch] * zones[0].up);
+							for (auto k = 0; k < 9; k++) fb.coeffs[chan_i * 9 + k] = 0;
+							fb.coeffs[chan_i * 9 + 0] = float_to_half(zones[0].rgb[chan_i]);
+							fb.coeffs[chan_i * 9 + 2] = float_to_half(zones[0].rgb[chan_i] * zones[0].up);
 						}
 						fb.coeffs[27] = float_to_half(1.0f);
 					}
