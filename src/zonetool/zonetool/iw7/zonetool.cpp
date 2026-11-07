@@ -305,7 +305,12 @@ namespace zonetool::iw7
 		// dump referenced later
 		if (is_referenced_asset(asset))
 		{
-			//referenced_assets.emplace_back(asset->type, get_asset_name(asset));
+			// -dumpzonetypes: a requested type that this zone only references (",name") is defined in another
+			// zone (a map's materials live in techsets_<map>): dump it from the loaded definition afterwards
+			if (asset_type_filter.size() > 0)
+			{
+				referenced_assets.emplace_back(asset->type, get_asset_name(asset));
+			}
 			return;
 		}
 
@@ -327,6 +332,7 @@ namespace zonetool::iw7
 		referenced_assets.erase(std::unique(referenced_assets.begin(),
 			referenced_assets.end()), referenced_assets.end());
 
+		std::size_t refs_dumped = 0, refs_missing = 0, refs_images = 0;
 		for (auto& asset : referenced_assets)
 		{
 			if (asset.second.length() <= 1)
@@ -338,7 +344,11 @@ namespace zonetool::iw7
 
 			if (asset.first == ASSET_TYPE_IMAGE)
 			{
-				ZONETOOL_WARNING("Not dumping referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				refs_images++;
+				if (asset_type_filter.empty())
+				{
+					ZONETOOL_WARNING("Not dumping referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				}
 				continue;
 			}
 
@@ -347,8 +357,10 @@ namespace zonetool::iw7
 			if (!asset_header.data || DB_IsXAssetDefault(asset.first, asset_name))
 			{
 				ZONETOOL_ERROR("Could not find referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				refs_missing++;
 				continue;
 			}
+			refs_dumped++;
 
 			//ZONETOOL_INFO("Dumping additional asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
 
@@ -359,6 +371,12 @@ namespace zonetool::iw7
 			};
 
 			dump_asset(&referenced_asset);
+		}
+
+		if (!referenced_assets.empty())
+		{
+			ZONETOOL_INFO("Referenced assets of the requested types: %zu dumped from their defining zone, %zu not loaded, %zu images skipped",
+				refs_dumped, refs_missing, refs_images);
 		}
 
 		referenced_assets.clear();
@@ -1269,6 +1287,16 @@ namespace zonetool::iw7
 						{
 							const auto type = type_to_int(type_str);
 							if (type != -1) asset_type_filter.insert(static_cast<XAssetType>(type));
+							else ZONETOOL_ERROR("Asset type \"%s\" does not exist", type_str.data());
+						}
+						// a map zone only references its materials and techsets (",name"): their definitions are in
+						// techsets_<zone>; load that zone first so the references resolve and can be dumped
+						const auto companion = "techsets_"s + args[i + 1];
+						if (!args[i + 1].starts_with("techsets_") && zone_exists(companion) && !is_zone_loaded(companion))
+						{
+							ZONETOOL_INFO("Loading \"%s\" first (definitions of the zone's referenced materials/techsets)", companion.data());
+							load_zone(companion, DB_LOAD_ASYNC, false);
+							wait_for_database();
 						}
 						dump_zone(args[i + 1], game::iw7);
 						i += 2;
