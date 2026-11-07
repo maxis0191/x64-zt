@@ -1143,6 +1143,39 @@ namespace zonetool::iw7::iwzmap
 			}
 			if (n && grid_template < 0) throw std::runtime_error("the template world has no light grid lit static model");
 
+			// lod/surface layout of a model ("numLods:s0,s1,..") and the first light grid lit template instance of each
+			// layout, scanned on first need (template models are parsed from the template dump into scratch memory)
+			auto model_shape = [](const XModel* m)
+			{
+				std::string k = std::to_string(m->numLods) + ":";
+				for (auto l = 0; l < m->numLods && l < 6; l++) k += std::to_string(m->lodInfo[l].numsurfs) + ",";
+				return k;
+			};
+			std::unordered_map<std::string, int> donor_by_shape;
+			bool donors_scanned = false;
+			auto find_shape_donor = [&](const std::string& want) -> int
+			{
+				if (!donors_scanned)
+				{
+					donors_scanned = true;
+					for (const auto& [name, idx] : by_model)
+					{
+						xmodel parser;
+						zone_memory scratch(64ull * 1024 * 1024);
+						const auto* m = parser.parse(name, &scratch);
+						if (m)
+						{
+							const auto k = model_shape(m);
+							if (!donor_by_shape.contains(k) || idx < static_cast<unsigned int>(donor_by_shape[k])) donor_by_shape[k] = static_cast<int>(idx);
+						}
+						scratch.free();
+					}
+					ZONETOOL_INFO("iwzmap: static model donors: %zu lod/surface layouts among %zu light grid lit template models", donor_by_shape.size(), by_model.size());
+				}
+				const auto it = donor_by_shape.find(want);
+				return it == donor_by_shape.end() ? -1 : it->second;
+			};
+
 			auto* insts = mem->allocate<GfxStaticModelInst>(std::max(n, 1u));
 			auto* draws = mem->allocate<GfxStaticModelDrawInst>(std::max(n, 1u));
 			auto* lod = mem->allocate<unsigned int>(n + 1);
@@ -1157,10 +1190,26 @@ namespace zonetool::iw7::iwzmap
 			for (auto i = 0u; i < n; i++)
 			{
 				const auto& s = list[i];
-				const auto t = by_model.contains(s.model) ? by_model[s.model] : static_cast<unsigned int>(grid_template);
+				auto t = by_model.contains(s.model) ? by_model[s.model] : static_cast<unsigned int>(grid_template);
 				if (by_model.contains(s.model)) copied++;
-				else if (!stubs.contains(s.model)) ZONETOOL_WARNING("iwzmap: static model %s has no light grid lit template instance; using the defaults of %s", s.model.data(),
-					d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
+				else
+				{
+					// A model without a light grid lit template instance must borrow the draw instance of a template model
+					// with the SAME lod / surface layout: the draw instance carries per-surface data, and a donor with more
+					// surfaces made the draw pass read materials past the model's list (Station Zero g19-g21: access
+					// violation at iw7_ship+0xDCE6E7, donor zmb_bumper_cars_building_signage_backdrop, 107 surfaces).
+					const auto want = s.xmodel ? model_shape(s.xmodel) : std::string();
+					const auto donor = want.empty() ? -1 : find_shape_donor(want);
+					if (donor >= 0) t = static_cast<unsigned int>(donor);
+					else if (std::getenv("IWZ_SMODEL_ALLOW_SHAPE_MISMATCH"))
+						ZONETOOL_WARNING("iwzmap: static model %s (%s) has no template donor of the same lod/surface layout; using %s anyway (IWZ_SMODEL_ALLOW_SHAPE_MISMATCH)",
+							s.model.data(), want.data(), d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
+					else
+						throw std::runtime_error("static model " + s.model + " (lods/surfaces " + want + ") has no light grid lit template instance of its own "
+							"and no template donor with the same lod/surface layout: place it as a script_model (or set IWZ_SMODEL_ALLOW_SHAPE_MISMATCH)");
+					if (!stubs.contains(s.model)) ZONETOOL_INFO("iwzmap: static model %s (%s) borrows the draw instance of %s (same lod/surface layout)", s.model.data(),
+						want.data(), d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
+				}
 				auto& dinst = draws[i];
 				dinst = d.smodelDrawInsts[t];
 				for (auto a = 0; a < 3; a++)
