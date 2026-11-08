@@ -597,6 +597,144 @@ namespace zonetool::iw7::iwzmap
 			return zones;
 		}
 
+		// Reflection probes (owner/coordinator 2026-11-08: pale Spaceland glyphs on the generated ceilings). The world
+		// keeps the template's probe instances and cube array, so generated surfaces reflect cp_zmb's signage. With
+		// IWZ_PROBES=neutral every lighting.txt room gets its own probe instance (its box as the volume, its centre as
+		// the capture point) whose cube is a constant colour: the room's ambient rgb times IWZ_PROBES_SCALE (default
+		// 0.25), i.e. a dim neutral environment matching the room. Instances beyond the rooms are parked far outside the
+		// world. Needs an unstreamed R16G16B16A16_FLOAT cube array (element-major subresources); anything else is logged
+		// and left alone. IWZ_PROBES_NO_RELIGHT=1 also drops the runtime relighting table (template GBuffer relight).
+		// BC6H_UF16 mode 11 (mode bits 00011): endpoints rw,gw,bw then rx,gx,bx (10 bits each), then 63 index bits.
+		// Equal endpoints and zero indices give a constant colour. Unsigned 10-bit unquantisation: unq = (q << 16 |
+		// 0x8000) >> 10, half = unq * 31 >> 6, so q = round((half - 15.5) / 31).
+		std::array<std::uint8_t, 16> bc6h_constant(const std::uint16_t half_rgb[3])
+		{
+			std::array<std::uint8_t, 16> block{};
+			unsigned int bit = 0;
+			auto put = [&](std::uint32_t value, unsigned int count)
+			{
+				for (auto i = 0u; i < count; i++, bit++)
+					if ((value >> i) & 1u) block[bit >> 3] |= static_cast<std::uint8_t>(1u << (bit & 7u));
+			};
+			put(0x03u, 5);
+			std::uint32_t q[3];
+			for (auto c = 0; c < 3; c++)
+			{
+				const auto h = static_cast<double>(half_rgb[c] & 0x7FFFu);
+				q[c] = static_cast<std::uint32_t>(std::clamp(std::lround((h - 15.5) / 31.0), 0L, 1022L));
+			}
+			for (auto e = 0; e < 2; e++) for (auto c = 0; c < 3; c++) put(q[c], 10);
+			return block;      // remaining 63 index bits stay 0
+		}
+
+		GfxImage* g_probe_image = nullptr;      // modified cube array, dumped into the new map (after set_fastfile)
+
+		unsigned int neutralize_reflection_probes(GfxWorld* w, const std::vector<ambient_zone>& zones, const world_source& src, zone_memory* mem)
+		{
+			const auto* mode = std::getenv("IWZ_PROBES");
+			if (!mode || std::string(mode) != "neutral") return 0;
+			auto& rp = w->draw.reflectionProbeData;
+			auto* img = rp.reflectionProbeArrayImage;
+			if (img && !img->pixelData && img->name)
+			{
+				// the world only references the array by name: read the template image itself (template fastfile is
+				// still the active one here), modify it and dump it into the new map with the world
+				gfx_image parser;
+				auto* full = parser.parse(img->name, mem);
+				if (full) img = full;
+			}
+			std::vector<const ambient_zone*> rooms;
+			for (const auto& z : zones) if (z.maxs[0] - z.mins[0] < 1.0e6f) rooms.push_back(&z);
+			if (!img || !img->pixelData || img->streamed || rooms.empty())
+			{
+				ZONETOOL_WARNING("iwzmap: probes: no unstreamed cube array or no rooms (image %p, streamed %d, rooms %zu): left as is",
+					static_cast<void*>(img), img ? img->streamed : -1, rooms.size());
+				return 0;
+			}
+			const auto fmt = static_cast<int>(img->imageFormat);
+			// R16G16B16A16_FLOAT arrays store one face per element; BC6H_UF16 (cp_zmb) one whole cube (6 faces with mips)
+			const auto cubes = static_cast<unsigned int>(static_cast<int>(img->imageFormat) == 95 ? img->numElements : img->numElements / 6u);
+			const auto total = static_cast<std::size_t>(img->dataLen1);
+			ZONETOOL_INFO("iwzmap: probes: array %s %ux%u format %d elements %u levels %u bytes %zu; %u probes, %u instances, %u relight",
+				img->name, img->width, img->height, fmt, img->numElements, img->levelCount, total, rp.reflectionProbeCount,
+				rp.reflectionProbeInstanceCount, rp.probeRelightingCount);
+			const auto per_check = img->numElements ? total / img->numElements : 0;
+			if ((fmt != 10 && fmt != 95) || img->numElements == 0 || total % img->numElements != 0 || per_check % (fmt == 95 ? 16 : 8) != 0)
+			{
+				ZONETOOL_WARNING("iwzmap: probes: unexpected array layout (format %d, %zu bytes for %u elements): left as is", fmt, total, img->numElements);
+				return 0;
+			}
+			const auto per = total / img->numElements;
+			const auto scale = std::getenv("IWZ_PROBES_SCALE") ? static_cast<float>(std::atof(std::getenv("IWZ_PROBES_SCALE"))) : 0.25f;
+			const auto n = std::min<std::size_t>({ rooms.size(), static_cast<std::size_t>(cubes), static_cast<std::size_t>(rp.reflectionProbeInstanceCount) });
+			for (auto k = 0u; k < n; k++)
+			{
+				const auto& z = *rooms[k];
+				std::uint16_t px[4];
+				for (auto c = 0; c < 3; c++) px[c] = float_to_half(z.rgb[c] * scale);
+				px[3] = float_to_half(1.0f);
+				if (fmt == 95)
+				{
+					// one element = one cube (6 faces, all mips): every 16-byte block the same constant block
+					const auto block = bc6h_constant(px);
+					auto* base = img->pixelData + static_cast<std::size_t>(k) * per;
+					for (std::size_t o = 0; o + 16 <= per; o += 16) std::memcpy(base + o, block.data(), 16);
+				}
+				else
+				{
+					for (auto f = 0u; f < 6u; f++)
+					{
+						auto* base = img->pixelData + (static_cast<std::size_t>(k) * 6u + f) * per;
+						for (std::size_t o = 0; o + 8 <= per; o += 8) std::memcpy(base + o, px, 8);
+					}
+				}
+				auto& inst = rp.reflectionProbeInstances[k];
+				float size[3];
+				for (auto a = 0; a < 3; a++)
+				{
+					inst.probePosition[a] = 0.5f * (z.mins[a] + z.maxs[a]);
+					inst.volumeObb.center[a] = inst.probePosition[a];
+					size[a] = z.maxs[a] - z.mins[a];
+					inst.volumeObb.halfSize[a] = 0.5f * size[a];
+					inst.volumeObb.xAxis[a] = a == 0 ? 1.0f : 0.0f;
+					inst.volumeObb.yAxis[a] = a == 1 ? 1.0f : 0.0f;
+					inst.volumeObb.zAxis[a] = a == 2 ? 1.0f : 0.0f;
+					inst.feather[a] = 16.0f;
+					inst.expandProjectionNeg[a] = 0.0f;
+					inst.expandProjectionPos[a] = 0.0f;
+				}
+				inst.probeRotation[0] = inst.probeRotation[1] = inst.probeRotation[2] = 0.0f;
+				inst.probeRotation[3] = 1.0f;
+				inst.probeImageIndex = static_cast<unsigned short>(k);
+				// smaller rooms win where boxes overlap (stairs inside the hall's margin)
+				inst.priority = 1.0e9f / std::max(1.0f, size[0] * size[1] * size[2]) + 1.0f;
+				ZONETOOL_INFO("iwzmap: probes: room %u box %.0f %.0f %.0f .. %.0f %.0f %.0f -> cube %u rgb %.4f %.4f %.4f", k,
+					z.mins[0], z.mins[1], z.mins[2], z.maxs[0], z.maxs[1], z.maxs[2], k, z.rgb[0] * scale, z.rgb[1] * scale, z.rgb[2] * scale);
+			}
+			auto parked = 0u;
+			for (auto i = static_cast<unsigned int>(n); i < rp.reflectionProbeInstanceCount; i++)
+			{
+				auto& inst = rp.reflectionProbeInstances[i];
+				for (auto a = 0; a < 3; a++) { inst.volumeObb.center[a] = 1.0e6f + 256.0f * i; inst.volumeObb.halfSize[a] = 1.0f; }
+				inst.priority = 0.0f;
+				parked++;
+			}
+			// any template instance whose volume still touches the generated world (should be 0)
+			auto overlapping = 0u;
+			for (auto i = static_cast<unsigned int>(n); i < rp.reflectionProbeInstanceCount; i++)
+			{
+				const auto& o = rp.reflectionProbeInstances[i].volumeObb;
+				bool hit = true;
+				for (auto a = 0; a < 3; a++) if (o.center[a] + o.halfSize[a] < src.mins[a] || o.center[a] - o.halfSize[a] > src.maxs[a]) hit = false;
+				if (hit) overlapping++;
+			}
+			if (std::getenv("IWZ_PROBES_NO_RELIGHT")) { rp.probeRelightingCount = 0; }
+			g_probe_image = img;
+			ZONETOOL_INFO("iwzmap: probes: neutral rooms %zu of %zu (cubes %u), parked %u template instances, template overlapping the world %u, relight %u",
+				n, rooms.size(), cubes, parked, overlapping, rp.probeRelightingCount);
+			return static_cast<unsigned int>(n);
+		}
+
 		unsigned int relight_probes(GfxGpuLightGridProbePosition* positions, GfxSHProbeData* probes, unsigned int count,
 			const std::vector<ambient_zone>& zones)
 		{
@@ -2762,6 +2900,12 @@ namespace zonetool::iw7::iwzmap
 					const auto a = relight_probes(grid.probePositions, grid.probes, grid.probeCount, zones);
 					const auto b = relight_probes(grid.gpuVisibleProbePositions, grid.gpuVisibleProbesData, grid.gpuVisibleProbesCount, zones);
 					ZONETOOL_INFO("iwzmap: relit %u light grid probes (%u gpu visible) from %zu lighting zones", a, b, zones.size());
+					{
+						// probe rooms: the generator's zone boxes (probes.txt, lighting.txt format); a baked lighting.txt has
+						// thousands of chart rooms
+						const auto probe_rooms = read_lighting(source + "\\probes.txt", src);
+						neutralize_reflection_probes(w, probe_rooms.empty() ? zones : probe_rooms, src, mem.get());
+					}
 					// points outside the template's probe tetrahedra (the generated rooms lie where the template has no
 					// probes) take their light grid zone's fallback probe: give every fallback the generated ambient
 					// (first lighting line) instead of the template's value (engine runs g2..g11: script models dark)
@@ -2817,6 +2961,11 @@ namespace zonetool::iw7::iwzmap
 			filesystem::set_fastfile(map);
 			gfx_world::dump(w);
 			dump_lightmap(baked);
+			if (g_probe_image)
+			{
+				gfx_image::dump(g_probe_image);
+				ZONETOOL_INFO("iwzmap: probes: wrote %s into the map", g_probe_image->name);
+			}
 			gfx_world_tr::dump(tz);
 			clip_map::dump(c);
 			com_world::dump(cw);
