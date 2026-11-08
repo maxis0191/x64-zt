@@ -1416,25 +1416,11 @@ namespace zonetool::iw7::iwzmap
 			{
 				if (l.name.empty()) continue;
 				const auto& p = cw->primaryLights[l.slot];
-				std::snprintf(buf, sizeof(buf), "{
-157 \"light_spot\"
-543 \"%g %g %g\"
-65 \"%g %g 0\"
-822 \"%s\"
-", l.origin[0], l.origin[1],
+				std::snprintf(buf, sizeof(buf), "{\n157 \"light_spot\"\n543 \"%g %g %g\"\n65 \"%g %g 0\"\n822 \"%s\"\n", l.origin[0], l.origin[1],
 					l.origin[2], l.spot ? l.pitch : 0.0f, l.spot ? l.yaw : 0.0f, l.name.data());
 				out += buf;
-				if (!l.group.empty()) out += "638 \"" + l.group + "\"
-";
-				std::snprintf(buf, sizeof(buf), "1 \"%u\"
-599 \"%g\"
-4524 \"%g %g %g\"
-39409 \"%g\"
-29508 \"%g\"
-29507 \"%g\"
-20434 \"%s\"
-}
-",
+				if (!l.group.empty()) out += "638 \"" + l.group + "\"\n";
+				std::snprintf(buf, sizeof(buf), "1 \"%u\"\n599 \"%g\"\n4524 \"%g %g %g\"\n39409 \"%g\"\n29508 \"%g\"\n29507 \"%g\"\n20434 \"%s\"\n}\n",
 					l.slot, l.radius, l.rgb[0], l.rgb[1], l.rgb[2], l.intensity, l.spot ? l.fov : 90.0f,
 					l.spot ? std::max(l.fov * 0.5f - 10.0f, l.fov * 0.25f) * 2.0f : 45.0f, p.defName ? p.defName : "light_point_linear");
 				out += buf;
