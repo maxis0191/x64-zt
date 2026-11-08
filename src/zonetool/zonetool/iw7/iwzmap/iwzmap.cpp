@@ -594,12 +594,22 @@ namespace zonetool::iw7::iwzmap
 		// 0.25), i.e. a dim neutral environment matching the room. Instances beyond the rooms are parked far outside the
 		// world. Needs an unstreamed R16G16B16A16_FLOAT cube array (element-major subresources); anything else is logged
 		// and left alone. IWZ_PROBES_NO_RELIGHT=1 also drops the runtime relighting table (template GBuffer relight).
-		unsigned int neutralize_reflection_probes(GfxWorld* w, const std::vector<ambient_zone>& zones, const world_source& src)
+		GfxImage* g_probe_image = nullptr;      // modified cube array, dumped into the new map (after set_fastfile)
+
+		unsigned int neutralize_reflection_probes(GfxWorld* w, const std::vector<ambient_zone>& zones, const world_source& src, zone_memory* mem)
 		{
 			const auto* mode = std::getenv("IWZ_PROBES");
 			if (!mode || std::string(mode) != "neutral") return 0;
 			auto& rp = w->draw.reflectionProbeData;
 			auto* img = rp.reflectionProbeArrayImage;
+			if (img && !img->pixelData && img->name)
+			{
+				// the world only references the array by name: read the template image itself (template fastfile is
+				// still the active one here), modify it and dump it into the new map with the world
+				gfx_image parser;
+				auto* full = parser.parse(img->name, mem);
+				if (full) img = full;
+			}
 			std::vector<const ambient_zone*> rooms;
 			for (const auto& z : zones) if (z.maxs[0] - z.mins[0] < 1.0e6f) rooms.push_back(&z);
 			if (!img || !img->pixelData || img->streamed || rooms.empty())
@@ -674,6 +684,7 @@ namespace zonetool::iw7::iwzmap
 				if (hit) overlapping++;
 			}
 			if (std::getenv("IWZ_PROBES_NO_RELIGHT")) { rp.probeRelightingCount = 0; }
+			g_probe_image = img;
 			ZONETOOL_INFO("iwzmap: probes: neutral rooms %zu of %zu (cubes %u), parked %u template instances, template overlapping the world %u, relight %u",
 				n, rooms.size(), cubes, parked, overlapping, rp.probeRelightingCount);
 			return static_cast<unsigned int>(n);
@@ -2778,7 +2789,12 @@ namespace zonetool::iw7::iwzmap
 					const auto a = relight_probes(grid.probePositions, grid.probes, grid.probeCount, zones);
 					const auto b = relight_probes(grid.gpuVisibleProbePositions, grid.gpuVisibleProbesData, grid.gpuVisibleProbesCount, zones);
 					ZONETOOL_INFO("iwzmap: relit %u light grid probes (%u gpu visible) from %zu lighting zones", a, b, zones.size());
-					neutralize_reflection_probes(w, zones, src);
+					{
+						// probe rooms: the generator's zone boxes (probes.txt, lighting.txt format); a baked lighting.txt has
+						// thousands of chart rooms
+						const auto probe_rooms = read_lighting(source + "\\probes.txt", src);
+						neutralize_reflection_probes(w, probe_rooms.empty() ? zones : probe_rooms, src, mem.get());
+					}
 					// points outside the template's probe tetrahedra (the generated rooms lie where the template has no
 					// probes) take their light grid zone's fallback probe: give every fallback the generated ambient
 					// (first lighting line) instead of the template's value (engine runs g2..g11: script models dark)
@@ -2834,6 +2850,11 @@ namespace zonetool::iw7::iwzmap
 			filesystem::set_fastfile(map);
 			gfx_world::dump(w);
 			dump_lightmap(baked);
+			if (g_probe_image)
+			{
+				gfx_image::dump(g_probe_image);
+				ZONETOOL_INFO("iwzmap: probes: wrote %s into the map", g_probe_image->name);
+			}
 			gfx_world_tr::dump(tz);
 			clip_map::dump(c);
 			com_world::dump(cw);
