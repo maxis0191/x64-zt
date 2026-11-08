@@ -67,8 +67,33 @@ namespace zonetool::t7
 					new_asset->lodInfo[i].dist = 1000000.0f;
 				}
 
-				for (auto i = 0; i < new_asset->numLods; i++)
+				// IW7 draws lodInfo[0] up close. BO3 stores some models' meshes lowest detail first
+				// (wpn_t7_zmb_raygun_world: 103 triangles first, 3105 last; p7_zm_teddybear), so the
+				// LODs are ordered by triangle count, most detailed first; the distances, materials,
+				// part bits and collision LOD follow the same order.
+				std::vector<int> order(asset->numLods);
+				for (auto i = 0; i < asset->numLods; i++)
 				{
+					order[i] = i;
+				}
+				const auto mesh_tris = [&](const int index)
+				{
+					unsigned int tris = 0;
+					const auto* mesh = asset->meshes[index];
+					for (auto j = 0; mesh && mesh->surfs && j < mesh->numSurfs; j++)
+					{
+						tris += mesh->surfs[j].triCount;
+					}
+					return tris;
+				};
+				std::stable_sort(order.begin(), order.end(), [&](const int a, const int b)
+				{
+					return mesh_tris(a) > mesh_tris(b);
+				});
+
+				for (auto lod = 0; lod < new_asset->numLods; lod++)
+				{
+					const auto i = order[lod];
 					// i made up this function, not sure how its calculated in bo3
 					auto calc_lod_dist = [&]()
 					{
@@ -76,22 +101,22 @@ namespace zonetool::t7
 						return std::round(sqrtf(constantFactor / asset->averageTriArea[i]));
 					};
 
-					new_asset->lodInfo[i].dist = calc_lod_dist();
+					new_asset->lodInfo[lod].dist = calc_lod_dist();
 
-					new_asset->lodInfo[i].numsurfs = asset->meshes[i]->numSurfs;
-					new_asset->lodInfo[i].surfIndex = 0;
-					new_asset->lodInfo[i].modelSurfs = allocator.allocate<zonetool::iw7::XModelSurfs>();
-					new_asset->lodInfo[i].modelSurfs->name = allocator.duplicate_string(asset->meshes[i]->name);
-					memcpy(&new_asset->lodInfo[i].partBits, &asset->meshes[i]->partBits, sizeof(float[8]));
+					new_asset->lodInfo[lod].numsurfs = asset->meshes[i]->numSurfs;
+					new_asset->lodInfo[lod].surfIndex = 0;
+					new_asset->lodInfo[lod].modelSurfs = allocator.allocate<zonetool::iw7::XModelSurfs>();
+					new_asset->lodInfo[lod].modelSurfs->name = allocator.duplicate_string(asset->meshes[i]->name);
+					memcpy(&new_asset->lodInfo[lod].partBits, &asset->meshes[i]->partBits, sizeof(float[8]));
 				}
 
 				std::vector<Material*> materials;
 				std::vector<vec_t> himipInvSqRadiis;
 				unsigned short surfIndex = 0;
 
-				for (auto i = 0; i < new_asset->numLods; i++)
+				for (auto lod = 0; lod < new_asset->numLods; lod++)
 				{
-					auto mesh_material = asset->meshMaterials[i];
+					auto mesh_material = asset->meshMaterials[order[lod]];
 
 					for (auto j = 0; j < mesh_material.numMaterials; j++)
 					{
@@ -100,7 +125,7 @@ namespace zonetool::t7
 						himipInvSqRadiis.push_back(mesh_material.himipInvSqRadii[j]);
 					}
 
-					new_asset->lodInfo[i].surfIndex = surfIndex;
+					new_asset->lodInfo[lod].surfIndex = surfIndex;
 					surfIndex += mesh_material.numMaterials;
 				}
 
@@ -114,11 +139,11 @@ namespace zonetool::t7
 				new_asset->collLod = 0xFFui8;
 				if (asset->collLod)
 				{
-					for (char i = 0; i < new_asset->numLods; i++)
+					for (char lod = 0; lod < new_asset->numLods; lod++)
 					{
-						if (*asset->collLod == asset->meshes[i])
+						if (*asset->collLod == asset->meshes[order[lod]])
 						{
-							new_asset->collLod = i;
+							new_asset->collLod = lod;
 						}
 					}
 				}
