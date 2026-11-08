@@ -587,6 +587,98 @@ namespace zonetool::iw7::iwzmap
 			return zones;
 		}
 
+		// Reflection probes (owner/coordinator 2026-11-08: pale Spaceland glyphs on the generated ceilings). The world
+		// keeps the template's probe instances and cube array, so generated surfaces reflect cp_zmb's signage. With
+		// IWZ_PROBES=neutral every lighting.txt room gets its own probe instance (its box as the volume, its centre as
+		// the capture point) whose cube is a constant colour: the room's ambient rgb times IWZ_PROBES_SCALE (default
+		// 0.25), i.e. a dim neutral environment matching the room. Instances beyond the rooms are parked far outside the
+		// world. Needs an unstreamed R16G16B16A16_FLOAT cube array (element-major subresources); anything else is logged
+		// and left alone. IWZ_PROBES_NO_RELIGHT=1 also drops the runtime relighting table (template GBuffer relight).
+		unsigned int neutralize_reflection_probes(GfxWorld* w, const std::vector<ambient_zone>& zones, const world_source& src)
+		{
+			const auto* mode = std::getenv("IWZ_PROBES");
+			if (!mode || std::string(mode) != "neutral") return 0;
+			auto& rp = w->draw.reflectionProbeData;
+			auto* img = rp.reflectionProbeArrayImage;
+			std::vector<const ambient_zone*> rooms;
+			for (const auto& z : zones) if (z.maxs[0] - z.mins[0] < 1.0e6f) rooms.push_back(&z);
+			if (!img || !img->pixelData || img->streamed || rooms.empty())
+			{
+				ZONETOOL_WARNING("iwzmap: probes: no unstreamed cube array or no rooms (image %p, streamed %d, rooms %zu): left as is",
+					static_cast<void*>(img), img ? img->streamed : -1, rooms.size());
+				return 0;
+			}
+			const auto fmt = static_cast<int>(img->imageFormat);
+			const auto cubes = static_cast<unsigned int>(img->numElements / 6u);
+			const auto total = static_cast<std::size_t>(img->dataLen1);
+			ZONETOOL_INFO("iwzmap: probes: array %s %ux%u format %d elements %u levels %u bytes %zu; %u probes, %u instances, %u relight",
+				img->name, img->width, img->height, fmt, img->numElements, img->levelCount, total, rp.reflectionProbeCount,
+				rp.reflectionProbeInstanceCount, rp.probeRelightingCount);
+			if (fmt != 10 || img->numElements == 0 || total % img->numElements != 0 || (total / img->numElements) % 8 != 0)
+			{
+				ZONETOOL_WARNING("iwzmap: probes: unexpected array layout (format %d, %zu bytes for %u elements): left as is", fmt, total, img->numElements);
+				return 0;
+			}
+			const auto per = total / img->numElements;
+			const auto scale = std::getenv("IWZ_PROBES_SCALE") ? static_cast<float>(std::atof(std::getenv("IWZ_PROBES_SCALE"))) : 0.25f;
+			const auto n = std::min<std::size_t>({ rooms.size(), static_cast<std::size_t>(cubes), static_cast<std::size_t>(rp.reflectionProbeInstanceCount) });
+			for (auto k = 0u; k < n; k++)
+			{
+				const auto& z = *rooms[k];
+				std::uint16_t px[4];
+				for (auto c = 0; c < 3; c++) px[c] = float_to_half(z.rgb[c] * scale);
+				px[3] = float_to_half(1.0f);
+				for (auto f = 0u; f < 6u; f++)
+				{
+					auto* base = img->pixelData + (static_cast<std::size_t>(k) * 6u + f) * per;
+					for (std::size_t o = 0; o + 8 <= per; o += 8) std::memcpy(base + o, px, 8);
+				}
+				auto& inst = rp.reflectionProbeInstances[k];
+				float size[3];
+				for (auto a = 0; a < 3; a++)
+				{
+					inst.probePosition[a] = 0.5f * (z.mins[a] + z.maxs[a]);
+					inst.volumeObb.center[a] = inst.probePosition[a];
+					size[a] = z.maxs[a] - z.mins[a];
+					inst.volumeObb.halfSize[a] = 0.5f * size[a];
+					inst.volumeObb.xAxis[a] = a == 0 ? 1.0f : 0.0f;
+					inst.volumeObb.yAxis[a] = a == 1 ? 1.0f : 0.0f;
+					inst.volumeObb.zAxis[a] = a == 2 ? 1.0f : 0.0f;
+					inst.feather[a] = 16.0f;
+					inst.expandProjectionNeg[a] = 0.0f;
+					inst.expandProjectionPos[a] = 0.0f;
+				}
+				inst.probeRotation[0] = inst.probeRotation[1] = inst.probeRotation[2] = 0.0f;
+				inst.probeRotation[3] = 1.0f;
+				inst.probeImageIndex = static_cast<unsigned short>(k);
+				// smaller rooms win where boxes overlap (stairs inside the hall's margin)
+				inst.priority = 1.0e9f / std::max(1.0f, size[0] * size[1] * size[2]) + 1.0f;
+				ZONETOOL_INFO("iwzmap: probes: room %u box %.0f %.0f %.0f .. %.0f %.0f %.0f -> cube %u rgb %.4f %.4f %.4f", k,
+					z.mins[0], z.mins[1], z.mins[2], z.maxs[0], z.maxs[1], z.maxs[2], k, z.rgb[0] * scale, z.rgb[1] * scale, z.rgb[2] * scale);
+			}
+			auto parked = 0u;
+			for (auto i = static_cast<unsigned int>(n); i < rp.reflectionProbeInstanceCount; i++)
+			{
+				auto& inst = rp.reflectionProbeInstances[i];
+				for (auto a = 0; a < 3; a++) { inst.volumeObb.center[a] = 1.0e6f + 256.0f * i; inst.volumeObb.halfSize[a] = 1.0f; }
+				inst.priority = 0.0f;
+				parked++;
+			}
+			// any template instance whose volume still touches the generated world (should be 0)
+			auto overlapping = 0u;
+			for (auto i = static_cast<unsigned int>(n); i < rp.reflectionProbeInstanceCount; i++)
+			{
+				const auto& o = rp.reflectionProbeInstances[i].volumeObb;
+				bool hit = true;
+				for (auto a = 0; a < 3; a++) if (o.center[a] + o.halfSize[a] < src.mins[a] || o.center[a] - o.halfSize[a] > src.maxs[a]) hit = false;
+				if (hit) overlapping++;
+			}
+			if (std::getenv("IWZ_PROBES_NO_RELIGHT")) { rp.probeRelightingCount = 0; }
+			ZONETOOL_INFO("iwzmap: probes: neutral rooms %zu of %zu (cubes %u), parked %u template instances, template overlapping the world %u, relight %u",
+				n, rooms.size(), cubes, parked, overlapping, rp.probeRelightingCount);
+			return static_cast<unsigned int>(n);
+		}
+
 		unsigned int relight_probes(GfxGpuLightGridProbePosition* positions, GfxSHProbeData* probes, unsigned int count,
 			const std::vector<ambient_zone>& zones)
 		{
@@ -2686,6 +2778,7 @@ namespace zonetool::iw7::iwzmap
 					const auto a = relight_probes(grid.probePositions, grid.probes, grid.probeCount, zones);
 					const auto b = relight_probes(grid.gpuVisibleProbePositions, grid.gpuVisibleProbesData, grid.gpuVisibleProbesCount, zones);
 					ZONETOOL_INFO("iwzmap: relit %u light grid probes (%u gpu visible) from %zu lighting zones", a, b, zones.size());
+					neutralize_reflection_probes(w, zones, src);
 					// points outside the template's probe tetrahedra (the generated rooms lie where the template has no
 					// probes) take their light grid zone's fallback probe: give every fallback the generated ambient
 					// (first lighting line) instead of the template's value (engine runs g2..g11: script models dark)
