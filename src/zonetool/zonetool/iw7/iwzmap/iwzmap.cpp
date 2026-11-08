@@ -594,6 +594,29 @@ namespace zonetool::iw7::iwzmap
 		// 0.25), i.e. a dim neutral environment matching the room. Instances beyond the rooms are parked far outside the
 		// world. Needs an unstreamed R16G16B16A16_FLOAT cube array (element-major subresources); anything else is logged
 		// and left alone. IWZ_PROBES_NO_RELIGHT=1 also drops the runtime relighting table (template GBuffer relight).
+		// BC6H_UF16 mode 11 (mode bits 00011): endpoints rw,gw,bw then rx,gx,bx (10 bits each), then 63 index bits.
+		// Equal endpoints and zero indices give a constant colour. Unsigned 10-bit unquantisation: unq = (q << 16 |
+		// 0x8000) >> 10, half = unq * 31 >> 6, so q = round((half - 15.5) / 31).
+		std::array<std::uint8_t, 16> bc6h_constant(const std::uint16_t half_rgb[3])
+		{
+			std::array<std::uint8_t, 16> block{};
+			unsigned int bit = 0;
+			auto put = [&](std::uint32_t value, unsigned int count)
+			{
+				for (auto i = 0u; i < count; i++, bit++)
+					if ((value >> i) & 1u) block[bit >> 3] |= static_cast<std::uint8_t>(1u << (bit & 7u));
+			};
+			put(0x03u, 5);
+			std::uint32_t q[3];
+			for (auto c = 0; c < 3; c++)
+			{
+				const auto h = static_cast<double>(half_rgb[c] & 0x7FFFu);
+				q[c] = static_cast<std::uint32_t>(std::clamp(std::lround((h - 15.5) / 31.0), 0L, 1022L));
+			}
+			for (auto e = 0; e < 2; e++) for (auto c = 0; c < 3; c++) put(q[c], 10);
+			return block;      // remaining 63 index bits stay 0
+		}
+
 		GfxImage* g_probe_image = nullptr;      // modified cube array, dumped into the new map (after set_fastfile)
 
 		unsigned int neutralize_reflection_probes(GfxWorld* w, const std::vector<ambient_zone>& zones, const world_source& src, zone_memory* mem)
@@ -619,12 +642,14 @@ namespace zonetool::iw7::iwzmap
 				return 0;
 			}
 			const auto fmt = static_cast<int>(img->imageFormat);
-			const auto cubes = static_cast<unsigned int>(img->numElements / 6u);
+			// R16G16B16A16_FLOAT arrays store one face per element; BC6H_UF16 (cp_zmb) one whole cube (6 faces with mips)
+			const auto cubes = static_cast<unsigned int>(static_cast<int>(img->imageFormat) == 95 ? img->numElements : img->numElements / 6u);
 			const auto total = static_cast<std::size_t>(img->dataLen1);
 			ZONETOOL_INFO("iwzmap: probes: array %s %ux%u format %d elements %u levels %u bytes %zu; %u probes, %u instances, %u relight",
 				img->name, img->width, img->height, fmt, img->numElements, img->levelCount, total, rp.reflectionProbeCount,
 				rp.reflectionProbeInstanceCount, rp.probeRelightingCount);
-			if (fmt != 10 || img->numElements == 0 || total % img->numElements != 0 || (total / img->numElements) % 8 != 0)
+			const auto per_check = img->numElements ? total / img->numElements : 0;
+			if ((fmt != 10 && fmt != 95) || img->numElements == 0 || total % img->numElements != 0 || per_check % (fmt == 95 ? 16 : 8) != 0)
 			{
 				ZONETOOL_WARNING("iwzmap: probes: unexpected array layout (format %d, %zu bytes for %u elements): left as is", fmt, total, img->numElements);
 				return 0;
@@ -638,10 +663,20 @@ namespace zonetool::iw7::iwzmap
 				std::uint16_t px[4];
 				for (auto c = 0; c < 3; c++) px[c] = float_to_half(z.rgb[c] * scale);
 				px[3] = float_to_half(1.0f);
-				for (auto f = 0u; f < 6u; f++)
+				if (fmt == 95)
 				{
-					auto* base = img->pixelData + (static_cast<std::size_t>(k) * 6u + f) * per;
-					for (std::size_t o = 0; o + 8 <= per; o += 8) std::memcpy(base + o, px, 8);
+					// one element = one cube (6 faces, all mips): every 16-byte block the same constant block
+					const auto block = bc6h_constant(px);
+					auto* base = img->pixelData + static_cast<std::size_t>(k) * per;
+					for (std::size_t o = 0; o + 16 <= per; o += 16) std::memcpy(base + o, block.data(), 16);
+				}
+				else
+				{
+					for (auto f = 0u; f < 6u; f++)
+					{
+						auto* base = img->pixelData + (static_cast<std::size_t>(k) * 6u + f) * per;
+						for (std::size_t o = 0; o + 8 <= per; o += 8) std::memcpy(base + o, px, 8);
+					}
 				}
 				auto& inst = rp.reflectionProbeInstances[k];
 				float size[3];
