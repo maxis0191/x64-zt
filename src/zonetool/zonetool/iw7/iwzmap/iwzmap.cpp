@@ -390,6 +390,10 @@ namespace zonetool::iw7::iwzmap
 			float fov = 90.0f;
 			bool shadow = false;
 			unsigned int slot = 0;
+			// script-switchable light (name=<targetname> [group=<script_noteworthy>]): takes a scriptable slot and
+			// gets a light_spot map entity, so level script can setlightintensity it (power-on lighting)
+			std::string name;
+			std::string group;
 		};
 
 		std::vector<light_source> read_lights(const std::string& path)
@@ -413,8 +417,14 @@ namespace zonetool::iw7::iwzmap
 					throw std::runtime_error("lights.txt line " + std::to_string(line_no) + ": expected x y z r g b intensity radius");
 				if (s.spot && !(l >> s.pitch >> s.yaw >> s.fov))
 					throw std::runtime_error("lights.txt line " + std::to_string(line_no) + ": a spot needs pitch yaw fov");
-				int shadow = 0;
-				if (l >> shadow) s.shadow = shadow != 0;
+				// optional tail: [shadow] [name=<targetname>] [group=<script_noteworthy>]
+				for (std::string tok; l >> tok;)
+				{
+					if (tok.rfind("name=", 0) == 0) s.name = tok.substr(5);
+					else if (tok.rfind("group=", 0) == 0) s.group = tok.substr(6);
+					else if (tok == "0" || tok == "1") s.shadow = tok == "1";
+					else throw std::runtime_error("lights.txt line " + std::to_string(line_no) + ": unknown token " + tok);
+				}
 				if (!(s.radius > 0.0f)) throw std::runtime_error("lights.txt line " + std::to_string(line_no) + ": radius must be positive");
 				list.push_back(s);
 			}
@@ -1277,6 +1287,11 @@ namespace zonetool::iw7::iwzmap
 		// definition (light_point_linear) and entity id; position, shape and colour become the generated light's.
 		// The GfxWorld per-light data (shadow geometry, light region, frustum meshes) of the slot is moved with it.
 		// Returns the used slots (their Umbra objects are class 4).
+		// Named lights (scripted) take slots of the scriptable range [firstScriptablePrimaryLight, primaryLightCount)
+		// (cp_zmb: 25 spot slots 1014..1038, each linked to its light_spot map entity by the entity key "1" = light
+		// index). When more lights are named than the template has scriptable slots, the range is extended
+		// downwards over static template slots (firstScriptablePrimaryLight lowered; IWZ_NO_SCRIPT_LIGHT_EXTEND
+		// refuses instead): every primary light array is per light index, so only the range bounds change.
 		std::vector<unsigned int> assign_light_slots(ComWorld* cw, std::vector<light_source>& lights)
 		{
 			std::vector<unsigned int> slots;
@@ -1284,9 +1299,44 @@ namespace zonetool::iw7::iwzmap
 			std::vector<bool> used(cw->primaryLightCount);
 			unsigned int last_sun = 0;
 			for (auto k = 0u; k < cw->primaryLightCount; k++) if (cw->primaryLights[k].type == GFX_LIGHT_TYPE_DIR) last_sun = k;
+			auto named = 0u;
+			for (const auto& l : lights) if (!l.name.empty()) named++;
+			if (named && cw->scriptablePrimaryLightCount < named)
+			{
+				if (std::getenv("IWZ_NO_SCRIPT_LIGHT_EXTEND") || !cw->scriptablePrimaryLightCount)
+					throw std::runtime_error("lights.txt names " + std::to_string(named) + " lights, the template has " +
+						std::to_string(cw->scriptablePrimaryLightCount) + " scriptable light slots");
+				const auto first = cw->primaryLightCount - named;
+				if (first <= last_sun + 1) throw std::runtime_error("not enough template light slots for the named lights");
+				ZONETOOL_INFO("iwzmap: scriptable light range extended from %u..%u to %u..%u (%u named lights)",
+					cw->firstScriptablePrimaryLight, cw->primaryLightCount - 1, first, cw->primaryLightCount - 1, named);
+				cw->firstScriptablePrimaryLight = first;
+				cw->scriptablePrimaryLightCount = named;
+			}
 			const auto end = cw->scriptablePrimaryLightCount ? cw->firstScriptablePrimaryLight : cw->primaryLightCount;
+			// named lights first (scriptable range, same type preferred, any spot/omni slot otherwise)
 			for (auto& l : lights)
 			{
+				if (l.name.empty()) continue;
+				const auto want = l.spot ? GFX_LIGHT_TYPE_SPOT : GFX_LIGHT_TYPE_OMNI;
+				int pick = -1;
+				for (auto pass = 0; pass < 2 && pick < 0; pass++)
+					for (auto k = end; k < cw->primaryLightCount && pick < 0; k++)
+					{
+						if (used[k]) continue;
+						const auto t = cw->primaryLights[k].type;
+						if (pass == 0 && t != want) continue;
+						if (t != GFX_LIGHT_TYPE_SPOT && t != GFX_LIGHT_TYPE_OMNI) continue;
+						pick = static_cast<int>(k);
+					}
+				if (pick < 0) throw std::runtime_error("no scriptable light slot left for light " + l.name);
+				used[pick] = true;
+				l.slot = static_cast<unsigned int>(pick);
+				if (l.shadow && !cw->primaryLights[pick].canUseShadowMap) l.shadow = false; // slot has no shadow data
+			}
+			for (auto& l : lights)
+			{
+				if (!l.name.empty()) { slots.push_back(l.slot); continue; }
 				const auto want = l.spot ? GFX_LIGHT_TYPE_SPOT : GFX_LIGHT_TYPE_OMNI;
 				int pick = -1;
 				for (auto pass = 0; pass < 3 && pick < 0; pass++)
@@ -1352,6 +1402,45 @@ namespace zonetool::iw7::iwzmap
 				ZONETOOL_INFO("iwzmap: light %s slot %u at %.0f %.0f %.0f radius %.0f color %.0f %.0f %.0f%s", l.spot ? "spot" : "omni", l.slot,
 					l.origin[0], l.origin[1], l.origin[2], l.radius, p.color[0], p.color[1], p.color[2], l.shadow ? " shadow" : "");
 			}
+		}
+
+		// light_spot map entities of the named lights (stock cp_zmb layout of a scriptable light entity; keys are the
+		// template's entity string ids: 157 classname, 543 origin, 65 angles, 822 targetname, 638 script_noteworthy,
+		// 1 primary light index, 599 radius, 4524 _color, 39409 intensity, 29508 / 29507 fov outer / inner,
+		// 20434 light definition). The angles give the spot direction (pitch, yaw) like the light itself.
+		std::string light_ents_text(const ComWorld* cw, const std::vector<light_source>& lights)
+		{
+			std::string out;
+			char buf[512];
+			for (const auto& l : lights)
+			{
+				if (l.name.empty()) continue;
+				const auto& p = cw->primaryLights[l.slot];
+				std::snprintf(buf, sizeof(buf), "{
+157 \"light_spot\"
+543 \"%g %g %g\"
+65 \"%g %g 0\"
+822 \"%s\"
+", l.origin[0], l.origin[1],
+					l.origin[2], l.spot ? l.pitch : 0.0f, l.spot ? l.yaw : 0.0f, l.name.data());
+				out += buf;
+				if (!l.group.empty()) out += "638 \"" + l.group + "\"
+";
+				std::snprintf(buf, sizeof(buf), "1 \"%u\"
+599 \"%g\"
+4524 \"%g %g %g\"
+39409 \"%g\"
+29508 \"%g\"
+29507 \"%g\"
+20434 \"%s\"
+}
+",
+					l.slot, l.radius, l.rgb[0], l.rgb[1], l.rgb[2], l.intensity, l.spot ? l.fov : 90.0f,
+					l.spot ? std::max(l.fov * 0.5f - 10.0f, l.fov * 0.25f) * 2.0f : 45.0f, p.defName ? p.defName : "light_point_linear");
+				out += buf;
+				ZONETOOL_INFO("iwzmap: scripted light %s (group %s) -> scriptable slot %u", l.name.data(), l.group.empty() ? "-" : l.group.data(), l.slot);
+			}
+			return out;
 		}
 
 		// light frame: dir, up, side columns
@@ -2564,7 +2653,7 @@ namespace zonetool::iw7::iwzmap
 			const auto bsp = "maps/cp/" + map + ".d3dbsp";
 			const auto src = read_world(source + "\\world.bin");
 
-			std::string hkx, graph, ents, triggers, relocations;
+			std::string hkx, graph, ents, triggers, relocations, light_ents;
 			if (!utils::io::read_file(source + "\\colmap.hkx", &hkx)) throw std::runtime_error("missing colmap.hkx");
 			if (!utils::io::read_file(source + "\\navgraph.bin", &graph)) throw std::runtime_error("missing navgraph.bin");
 			if (!utils::io::read_file(source + "\\ents.txt", &ents)) throw std::runtime_error("missing ents.txt");
@@ -2673,6 +2762,7 @@ namespace zonetool::iw7::iwzmap
 				std::vector<ComPrimaryLight> before;
 				for (const auto& l : lights) before.push_back(cw->primaryLights[l.slot]);
 				build_com_lights(cw, lights);
+				light_ents = light_ents_text(cw, lights);
 				build_gfx(w, tz, src, smodels, slots, map, bsp, mem.get());
 				build_gfx_lights(w, before, cw, lights, src, mem.get());
 				voxel_layout lay;
@@ -2707,7 +2797,7 @@ namespace zonetool::iw7::iwzmap
 				}
 			}
 			build_clip(c, bsp, hkx, smodels, mem.get());
-			build_ents(e, bsp, ents, triggers, relocations, &me, src, mem.get());
+			build_ents(e, bsp, ents + light_ents, triggers, relocations, &me, src, mem.get());
 			build_nav(n, bsp, graph, mem.get());
 			if (!std::getenv("IWZ_CLEAR_DYNENTS"))
 			{
