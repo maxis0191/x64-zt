@@ -5,6 +5,7 @@
 #include "assets/physics_asset.hpp"
 #include "assets/sound_bank_subset_rules.hpp"
 #include "common/havok.hpp"
+#include "iwzmap/iwzmap.hpp"
 
 #include "../utils/gsc.hpp"
 #include "../utils/csv_generator.hpp"
@@ -228,6 +229,8 @@ namespace zonetool::iw7
 			DUMP_ASSET(ASSET_TYPE_RETICLE, reticle, ReticleDef);
 			DUMP_ASSET(ASSET_TYPE_RUMBLE, rumble, RumbleInfo);
 			DUMP_ASSET(ASSET_TYPE_RUMBLE_GRAPH, rumble_graph, RumbleGraph);
+			DUMP_ASSET(ASSET_TYPE_BEHAVIOR_TREE, behavior_tree, BehaviorTree);
+			DUMP_ASSET(ASSET_TYPE_ANIMCLASS, anim_class, AnimationClass);
 			DUMP_ASSET(ASSET_TYPE_SCRIPTABLE, scriptable_def, ScriptableDef);
 			DUMP_ASSET(ASSET_TYPE_SCRIPTFILE, scriptfile, ScriptFile);
 			DUMP_ASSET(ASSET_TYPE_STREAMING_INFO, streaming_info, StreamingInfo);
@@ -432,7 +435,12 @@ namespace zonetool::iw7
 		// dump referenced later
 		if (is_referenced_asset(asset))
 		{
-			//referenced_assets.emplace_back(asset->type, get_asset_name(asset));
+			// -dumpzonetypes: a requested type that this zone only references (",name") is defined in another
+			// zone (a map's materials live in techsets_<map>): dump it from the loaded definition afterwards
+			if (asset_type_filter.size() > 0)
+			{
+				referenced_assets.emplace_back(asset->type, get_asset_name(asset));
+			}
 			return;
 		}
 
@@ -492,6 +500,7 @@ namespace zonetool::iw7
 		referenced_assets.erase(std::unique(referenced_assets.begin(),
 			referenced_assets.end()), referenced_assets.end());
 
+		std::size_t refs_dumped = 0, refs_missing = 0, refs_images = 0;
 		for (auto& asset : referenced_assets)
 		{
 			if (asset.second.length() <= 1)
@@ -503,7 +512,11 @@ namespace zonetool::iw7
 
 			if (asset.first == ASSET_TYPE_IMAGE)
 			{
-				ZONETOOL_WARNING("Not dumping referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				refs_images++;
+				if (asset_type_filter.empty())
+				{
+					ZONETOOL_WARNING("Not dumping referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				}
 				continue;
 			}
 
@@ -512,8 +525,10 @@ namespace zonetool::iw7
 			if (!asset_header.data || DB_IsXAssetDefault(asset.first, asset_name))
 			{
 				ZONETOOL_ERROR("Could not find referenced asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
+				refs_missing++;
 				continue;
 			}
+			refs_dumped++;
 
 			//ZONETOOL_INFO("Dumping additional asset \"%s\" of type \"%s\"", asset_name, type_to_string(asset.first));
 
@@ -524,6 +539,12 @@ namespace zonetool::iw7
 			};
 
 			dump_asset(&referenced_asset);
+		}
+
+		if (!referenced_assets.empty())
+		{
+			ZONETOOL_INFO("Referenced assets of the requested types: %zu dumped from their defining zone, %zu not loaded, %zu images skipped",
+				refs_dumped, refs_missing, refs_images);
 		}
 
 		referenced_assets.clear();
@@ -587,11 +608,45 @@ namespace zonetool::iw7
 		ZONETOOL_INFO("Captured pre-registration donor PhysicsAsset %s (%u bytes, %s)", asset->name, asset->havokDataSize, hash.c_str());
 	}
 
+	namespace
+	{
+		std::mutex captured_shader_mutex;
+		std::unordered_map<std::string, std::string> captured_shaders[ASSET_TYPE_COUNT];
+
+		template <typename T>
+		void capture_shader(XAssetType type, T* shader)
+		{
+			if (!shader || !shader->name) return;
+			const auto& def = shader->prog.loadDef;
+			if (!def.program || def.programSize < 4 || std::memcmp(def.program, "DXBC", 4)) return;
+			std::lock_guard _(captured_shader_mutex);
+			captured_shaders[type].try_emplace(shader->name, reinterpret_cast<const char*>(def.program), def.programSize);
+		}
+	}
+
+	const std::string* find_captured_shader(XAssetType type, const std::string& name)
+	{
+		std::lock_guard _(captured_shader_mutex);
+		const auto it = captured_shaders[type].find(name);
+		return it == captured_shaders[type].end() ? nullptr : &it->second;
+	}
+
 	utils::hook::detour db_add_xasset_hook;
 	XAssetHeader db_add_xasset_stub(XAssetType type, XAssetHeader* header)
 	{
 		if (enemy_physics_capture && type == ASSET_TYPE_PHYSICSASSET && header)
 			capture_enemy_physics_asset(header->physicsAsset);
+
+		// keep shader bytecode: the engine drops it once the D3D object exists, and shaders are
+		// deduplicated into shared techset zones, so a new zone may need bytes it has no dump of
+		switch (type)
+		{
+		case ASSET_TYPE_PIXELSHADER: capture_shader(type, header->pixelShader); break;
+		case ASSET_TYPE_VERTEXSHADER: capture_shader(type, header->vertexShader); break;
+		case ASSET_TYPE_HULLSHADER: capture_shader(type, header->hullShader); break;
+		case ASSET_TYPE_DOMAINSHADER: capture_shader(type, header->domainShader); break;
+		default: break;
+		}
 
 		XAsset xasset =
 		{
@@ -1191,6 +1246,28 @@ namespace zonetool::iw7
 		::iw7::command::add("quit", []()
 		{
 			std::quick_exit(EXIT_SUCCESS);
+		});
+
+		::iw7::command::add("iwzcompile", [](const ::iw7::command::params& params)
+		{
+			if (params.size() < 5)
+			{
+				ZONETOOL_ERROR("usage: iwzcompile <template zone> <template map> <new map> <source dir>");
+				return;
+			}
+
+			iwzmap::compile(params.get(1), params.get(2), params.get(3), params.get(4));
+		});
+
+		::iw7::command::add("iwzbounds", [](const ::iw7::command::params& params)
+		{
+			if (params.size() < 4)
+			{
+				ZONETOOL_ERROR("usage: iwzbounds <template zone> <smodels.txt> <out.json>");
+				return;
+			}
+
+			iwzmap::smodel_bounds(params.get(1), params.get(2), params.get(3));
 		});
 
 		::iw7::command::add("buildzone", [](const ::iw7::command::params& params)
@@ -2705,6 +2782,20 @@ namespace zonetool::iw7
 
 						do_exit = true;
 					}
+					else if (args[i] == "-iwzcompile" && i + 4 < args.size())
+					{
+						iwzmap::compile(args[i + 1], args[i + 2], args[i + 3], args[i + 4]);
+						i += 4;
+
+						do_exit = true;
+					}
+					else if (args[i] == "-iwzbounds" && i + 3 < args.size())
+					{
+						iwzmap::smodel_bounds(args[i + 1], args[i + 2], args[i + 3]);
+						i += 3;
+
+						do_exit = true;
+					}
 					else if (args[i] == "-buildzone")
 					{
 						build_zone(args[i + 1]);
@@ -2740,6 +2831,30 @@ namespace zonetool::iw7
 					{
 						verify_zone(args[i + 1]);
 						i++;
+
+						do_exit = true;
+					}
+					else if (args[i] == "-dumpzonetypes" && i + 2 < args.size())
+					{
+						// -dumpzonetypes <zone> <type,type,...>: dump only the listed asset types
+						asset_type_filter.clear();
+						for (const auto& type_str : utils::string::split(args[i + 2], ','))
+						{
+							const auto type = type_to_int(type_str);
+							if (type != -1) asset_type_filter.insert(static_cast<XAssetType>(type));
+							else ZONETOOL_ERROR("Asset type \"%s\" does not exist", type_str.data());
+						}
+						// a map zone only references its materials and techsets (",name"): their definitions are in
+						// techsets_<zone>; load that zone first so the references resolve and can be dumped
+						const auto companion = "techsets_"s + args[i + 1];
+						if (!args[i + 1].starts_with("techsets_") && zone_exists(companion) && !is_zone_loaded(companion))
+						{
+							ZONETOOL_INFO("Loading \"%s\" first (definitions of the zone's referenced materials/techsets)", companion.data());
+							load_zone(companion, DB_LOAD_ASYNC, false);
+							wait_for_database();
+						}
+						dump_zone(args[i + 1], game::iw7);
+						i += 2;
 
 						do_exit = true;
 					}
