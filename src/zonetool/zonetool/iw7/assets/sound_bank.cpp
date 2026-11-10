@@ -4,6 +4,7 @@
 #include "../common/sound.hpp"
 
 #include "utils/io.hpp"
+#include "utils/flags.hpp"
 #include "utils/bit_buffer.hpp"
 #include "sound_bank_subset.hpp"
 
@@ -3319,7 +3320,9 @@ namespace zonetool::iw7
 			const auto path = create_path(bank, streamed);
 			if (utils::io::file_exists(path))
 			{
-				if (path.find(filesystem::get_fastfile()) == std::string::npos)
+				// A bank's files are named after its zone, which can differ from the fastfile (an iw7-mod mod zone's
+				// bank is always "mod"). Headless builds overwrite their own output instead of waiting on a dialog.
+				if (path.find(filesystem::get_fastfile()) == std::string::npos && !utils::flags::has_flag("headless"))
 				{
 					const int result = MessageBoxA(NULL, utils::string::va("You are about to overwrite file %s\nAre you sure?", path.data()), "WARNING", MB_YESNOCANCEL);
 
