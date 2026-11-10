@@ -2669,10 +2669,12 @@ namespace zonetool::iw7
 						has_seektable = true;
 					}
 
+					const auto block_size = entry.BlocksizeKB ? entry.BlocksizeKB * 1024u : BLOCK_SIZE;
+
 					write(write_metadata_block_header(has_seektable ? false : true, STREAMINFO, METADATA_STREAMINFO_LEN_BYTES));
 					StreamInfo info{};
-					info.min_blocksize = BLOCK_SIZE;
-					info.max_blocksize = BLOCK_SIZE;
+					info.min_blocksize = block_size;
+					info.max_blocksize = block_size;
 					info.min_framesize = FRAME_SIZE_UNKNOWN;
 					info.max_framesize = FRAME_SIZE_UNKNOWN;
 					info.sample_rate = entry.frameRate;
@@ -2707,7 +2709,29 @@ namespace zonetool::iw7
 				return std::memcmp(data.data(), MARKER, MARKER_LEN) == 0;
 			}
 
-			bool parse(std::string& path, SndAssetBankEntry* entry, filesystem::file& out_file, unsigned char* checksum, unsigned char* source_checksum)
+			// primed sounds keep their first 48 frames (max 128kb, cut mid-frame) in the loaded bank,
+			// the rest is streamed from the .sabs
+			size_t get_prime_size(const std::string& frames)
+			{
+				constexpr std::uint8_t prime_frame_count = 48;
+				constexpr size_t prime_max_size = 0x20000;
+
+				const auto* data = reinterpret_cast<const std::uint8_t*>(frames.data());
+				const auto max_size = frames.size() < prime_max_size ? frames.size() : prime_max_size;
+
+				// fixed blocksize frame headers: sync code, same blocksize/sample rate byte, frame number in byte 4
+				for (size_t pos = 1; pos < max_size && pos + 4 < frames.size(); pos++)
+				{
+					if (data[pos] == 0xFF && data[pos + 1] == 0xF8 && data[pos + 2] == data[2] && data[pos + 4] == prime_frame_count)
+					{
+						return pos;
+					}
+				}
+
+				return max_size;
+			}
+
+			bool parse(std::string& path, SndAssetBankEntry* entry, std::string& out_data, unsigned char* checksum, unsigned char* source_checksum)
 			{
 				auto file = filesystem::file(path);
 
@@ -2807,8 +2831,8 @@ namespace zonetool::iw7
 				md5_process(&md, reinterpret_cast<const unsigned char*>(buffer.data()), static_cast<unsigned int>(buffer.size()));
 				md5_done(&md, checksum);
 
-				out_file.write(buffer.data(), buffer.size());
 				entry->size = static_cast<unsigned int>(buffer.size() - entry->seekTableSize);
+				out_data = std::move(buffer);
 
 				return true;
 			}
@@ -3081,7 +3105,93 @@ namespace zonetool::iw7
 			return true;
 		}
 
-		bool dump_internal(std::string name, std::string language_folder, std::string language_prefix)
+		struct streamed_entry_ref
+		{
+			std::string path;
+			SndAssetBankEntry entry;
+		};
+
+		// Primed banks only contain the initial frames; the full stream may be in any sibling .sabs.
+		std::unordered_map<std::string, std::unordered_map<SndStringHash, streamed_entry_ref>> streamed_entry_index;
+
+		std::string normalize_path(const std::string& path)
+		{
+			return std::filesystem::path(path).lexically_normal().generic_string();
+		}
+
+		const std::unordered_map<SndStringHash, streamed_entry_ref>& get_streamed_entries(const std::string& directory)
+		{
+			if (const auto itr = streamed_entry_index.find(directory); itr != streamed_entry_index.end())
+			{
+				return itr->second;
+			}
+
+			auto& entries = streamed_entry_index[directory];
+			if (!utils::io::directory_exists(directory))
+			{
+				return entries;
+			}
+
+			for (const auto& path : utils::io::list_files(directory))
+			{
+				if (!path.ends_with(".sabs"))
+				{
+					continue;
+				}
+
+				auto file = filesystem::file(path);
+				file.open("rb", false, false);
+				if (!file.get_fp())
+				{
+					continue;
+				}
+
+				SndAssetBankHeader header{};
+				file.read(&header, sizeof(SndAssetBankHeader));
+				if (header.magic != MAGIC || header.version != VERSION)
+				{
+					continue;
+				}
+
+				std::vector<SndAssetBankEntry> bank_entries(header.entryCount);
+				file.seek(header.entryOffset, SEEK_SET);
+				file.read(bank_entries.data(), sizeof(SndAssetBankEntry), bank_entries.size());
+
+				for (const auto& entry : bank_entries)
+				{
+					const auto itr = entries.find(entry.id);
+					if (itr == entries.end() || itr->second.entry.size < entry.size)
+					{
+						entries[entry.id] = { normalize_path(path), entry };
+					}
+				}
+			}
+
+			return entries;
+		}
+
+		const streamed_entry_ref* find_full_streamed_entry(const std::string& bank_path, SndStringHash id)
+		{
+			auto directory = std::filesystem::path(bank_path).parent_path().generic_string();
+			if (directory.empty())
+			{
+				directory = ".";
+			}
+			const std::string root_directory = use_zone_dir() ? "zone" : ".";
+
+			for (const auto& dir : { directory, root_directory })
+			{
+				const auto& entries = get_streamed_entries(dir);
+				if (const auto itr = entries.find(id); itr != entries.end())
+				{
+					return &itr->second;
+				}
+			}
+
+			return nullptr;
+		}
+
+		bool dump_internal(std::string name, std::string language_folder, std::string language_prefix, const std::unordered_set<SndStringHash>& primed_ids)
 		{
 			const auto path = create_path(name, language_folder, language_prefix);
 			auto file = filesystem::file(path);
@@ -3100,6 +3210,9 @@ namespace zonetool::iw7
 				return false;
 			}
 
+			const auto is_loaded = path.ends_with(".sabl");
+			const auto own_streamed_path = normalize_path(path.substr(0, path.size() - 5) + ".sabs");
+
 			for (auto i = 0u; i < header.entryCount; i++)
 			{
 				SndAssetBankEntry entry{};
@@ -3111,8 +3224,36 @@ namespace zonetool::iw7
 				file.seek(header.AssetNameOffset + (sizeof(asset_name) * i), SEEK_SET);
 				file.read(asset_name, sizeof(asset_name));
 
-				file.seek(entry.offset, SEEK_SET);
-				auto data = file.read_bytes(entry.size + entry.seekTableSize + entry.hybridPcmSize);
+				std::vector<std::uint8_t> data;
+				if (is_loaded && primed_ids.contains(entry.id))
+				{
+					const auto* full_entry = find_full_streamed_entry(path, entry.id);
+					if (!full_entry)
+					{
+						ZONETOOL_WARNING("Primed sound \"%s\" has no streamed data in any .sabs, skipping", asset_name);
+						continue;
+					}
+
+					if (full_entry->path == own_streamed_path)
+					{
+						// dumped with this zone's streamed bank
+						continue;
+					}
+
+					ZONETOOL_INFO("Sound \"%s\" is primed, dumping full stream from \"%s\"", asset_name, full_entry->path.data());
+
+					entry = full_entry->entry;
+					auto stream_file = filesystem::file(full_entry->path);
+					stream_file.open("rb", false, false);
+					stream_file.seek(entry.offset, SEEK_SET);
+					data = stream_file.read_bytes(entry.size + entry.seekTableSize + entry.hybridPcmSize);
+					stream_file.close();
+				}
+				else
+				{
+					file.seek(entry.offset, SEEK_SET);
+					data = file.read_bytes(entry.size + entry.seekTableSize + entry.hybridPcmSize);
+				}
 
 				switch(entry.format)
 				{
@@ -3263,11 +3404,13 @@ namespace zonetool::iw7
 
 					if (!streamed)
 					{
-						if (alias->flags.type != SAT_LOADED)
+						if (alias->flags.type != SAT_LOADED && alias->flags.type != SAT_PRIMED)
 						{
 							continue;
 						}
 					}
+
+					const auto is_prime = !streamed && alias->flags.type == SAT_PRIMED;
 
 					SndAssetBankEntry entry{};
 					entry.id = alias->assetId;
@@ -3283,13 +3426,23 @@ namespace zonetool::iw7
 
 					checksum128_s checksum{};
 					checksum128_s source_checksum{};
+					std::string asset_data{};
 
 					switch (entry.format)
 					{
 					case SND_ASSET_FORMAT_FLAC:
-						if (!flac::parse(asset_file, &entry, file, checksum.md5, source_checksum.md5))
+						if (!flac::parse(asset_file, &entry, asset_data, checksum.md5, source_checksum.md5))
 						{
 							continue;
+						}
+
+						if (is_prime)
+						{
+							// the prime entry matches the streamed one (checksums included), minus the seektable
+							asset_data = asset_data.substr(entry.seekTableSize);
+							asset_data.resize(flac::get_prime_size(asset_data));
+							entry.size = static_cast<unsigned int>(asset_data.size());
+							entry.seekTableSize = 0;
 						}
 						break;
 					case SND_ASSET_FORMAT_PCMS16:
@@ -3305,6 +3458,8 @@ namespace zonetool::iw7
 					default:
 						__debugbreak();
 					}
+
+					file.write(asset_data.data(), asset_data.size());
 
 					assets.push_back(alias->assetFileName);
 					checksums.push_back(checksum);
@@ -3399,11 +3554,11 @@ namespace zonetool::iw7
 
 		namespace loaded
 		{
-			void dump(std::string name, std::string language_folder, std::string language_prefix)
+			void dump(std::string name, std::string language_folder, std::string language_prefix, const std::unordered_set<SndStringHash>& primed_ids)
 			{
 				if (!name.ends_with(".sabl")) name.append(".sabl");
 
-				dump_internal(name, language_folder, language_prefix);
+				dump_internal(name, language_folder, language_prefix, primed_ids);
 			}
 		}
 
@@ -3413,12 +3568,31 @@ namespace zonetool::iw7
 			{
 				if (!name.ends_with(".sabs")) name.append(".sabs");
 
-				dump_internal(name, language_folder, language_prefix);
+				dump_internal(name, language_folder, language_prefix, {});
 			}
 		}
 
-		void dump(const std::string& name, std::string language_folder = "", std::string language_prefix = "")
+		std::unordered_set<SndStringHash> get_primed_ids(SndBank* bank)
 		{
+			std::unordered_set<SndStringHash> primed_ids;
+			for (auto i = 0u; i < bank->aliasCount; i++)
+			{
+				for (auto j = 0; j < bank->alias[i].count; j++)
+				{
+					const auto* alias = &bank->alias[i].head[j];
+					if (alias->assetFileName && alias->flags.type == SAT_PRIMED)
+					{
+						primed_ids.insert(alias->assetId);
+					}
+				}
+			}
+			return primed_ids;
+		}
+
+		void dump(SndBank* bank)
+		{
+			std::string language_folder = bank->soundLanguage;
+			std::string language_prefix = bank->gameLanguage;
 			if (language_folder == "all")
 			{
 				language_folder.clear();
@@ -3428,8 +3602,8 @@ namespace zonetool::iw7
 				language_prefix.clear();
 			}
 
-			loaded::dump(name, language_folder, language_prefix);
-			streamed::dump(name, language_folder, language_prefix);
+			loaded::dump(bank->zone, language_folder, language_prefix, get_primed_ids(bank));
+			streamed::dump(bank->zone, language_folder, language_prefix);
 		}
 
 		void create(SndBank* bank)
@@ -3972,7 +4146,7 @@ namespace zonetool::iw7
 
 		// music todo...
 
-		sound_asset_bank::dump(asset->zone, asset->soundLanguage, asset->gameLanguage);
+		sound_asset_bank::dump(asset);
 
 		file.write(data.dump(4));
 		file.close();

@@ -88,6 +88,23 @@ These commands use the installed game's local IW7 database. Keep extracted rows,
   * `skip common`: Skips common zones when dumping a map, can be `true` or `false`.
   * `target game`: The game to convert the assets to.
 
+## IW7 map compiler (`-iwzcompile`)
+IW7 has no map compiler of its own. `-iwzcompile` builds a new IW7 map (render geometry, Havok collision, nav graph, entities, lightmap, static models, door brush models, trigger volumes, darkness/named lights) around the world assets of a stock map, which is used as a template for sun, sky, light grid and reflection probes. It writes the regular dump layout, ready for `-buildzone`.
+
+```
+zonetool.exe -headless -unbuffered-io -iwzcompile <template zone> <template map> <new map> <source dir>
+zonetool.exe -headless -unbuffered-io -iwzcompile cp_zmb_tpl cp_zmb cp_iwz C:\work\iwz_src
+```
+
+* Run it from a work folder that holds the game's `zone` files, as for any ZoneTool run. The template zone is a dump of the stock map at `zonetool/<template zone>`.
+* `<source dir>` holds `world.bin`, `colmap.hkx`, `navgraph.bin` and `ents.txt`, plus the optional `lighting.txt`, `lights.txt`, `probes.txt`, `smodels.txt`, `triggers.txt`, `scriptables.txt` and a `lightmap` folder.
+* The output goes to `dump/<new map>/` (`maps/cp/<map>.d3dbsp.*`, `images`, `lightmaps`, `transient_zones`).
+* Switches are environment variables (`IWZ_GEN_TOME=1`, `IWZ_KEEP_ENTSHAPES=1`, `IWZ_KEEP_SUBMODELS=1`, `IWZ_TRIGGER_SHAPES=1`, ...); the full list is in `src/zonetool/zonetool/iw7/iwzmap/`.
+* Generated trigger volumes get their own box shapes (`iwzmap_volumes.cpp`) instead of borrowing a template trigger's shape.
+* Two runs of the same input differ in a few padding bytes of the output headers (uninitialised pointer residue); the map data itself is identical.
+
+The creator SDK (`maxis0191/iw7-creator-sdk`, `tools-source/iwzmap`) generates the source folder and calls this command.
+
 ## Asset Conversion Support
 
 The table below shows which asset conversions are currently supported.
