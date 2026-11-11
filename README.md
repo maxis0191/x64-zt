@@ -100,6 +100,7 @@ zonetool.exe -headless -unbuffered-io -iwzcompile cp_zmb_tpl cp_zmb cp_iwz C:\wo
 * `<source dir>` holds `world.bin`, `colmap.hkx`, `navgraph.bin` and `ents.txt`, plus the optional `lighting.txt`, `lights.txt`, `probes.txt`, `smodels.txt`, `triggers.txt`, `scriptables.txt` and a `lightmap` folder.
 * The output goes to `dump/<new map>/` (`maps/cp/<map>.d3dbsp.*`, `images`, `lightmaps`, `transient_zones`).
 * Switches are environment variables (`IWZ_GEN_TOME=1`, `IWZ_KEEP_ENTSHAPES=1`, `IWZ_KEEP_SUBMODELS=1`, `IWZ_TRIGGER_SHAPES=1`, ...); the full list is in `src/zonetool/zonetool/iw7/iwzmap/`.
+* Static models (`smodels.txt`: `<xmodel> x y z pitch yaw roll scale [noshadow] [nocollision] [cull=<units>]`) are lit by the light grid. A model the template map does not carry (a kit model of another map, an authored model) is read from `xmodel/<name>.xmb` next to `smodels.txt` and must be in the zone (the SDK's kit import); its draw instance starts from a neutral template instance with the model-dependent fields fitted (`iwzmap_smodel_rules.hpp`). Copying another model's draw instance verbatim made the game read past the model's material list (access violation at `iw7_ship+0xDCE6E7`); `IWZ_SMODEL_DONOR=<template model>` restores that behaviour to reproduce it.
 * Generated trigger volumes get their own box shapes (`iwzmap_volumes.cpp`) instead of borrowing a template trigger's shape.
 * Two runs of the same input differ in a few padding bytes of the output headers (uninitialised pointer residue); the map data itself is identical.
 
