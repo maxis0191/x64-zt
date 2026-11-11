@@ -211,10 +211,22 @@ namespace zonetool::iw7::iwzmap
 			t.put<std::uint32_t>(cell_index, 0);
 			t.put<std::uint32_t>(cell_index + 4, 0xFFFFFFFF);
 			t.put<std::uint32_t>(tile + 0x40, cell_index - tile);
+			// The camera's cell: the query reads the tile's cell count from the high half of tile +0x34 and, in the
+			// cell record, the global cell index at +0x10 (cp_zmb: tile +0x34 = 0x00010001, cell +0x10 = its
+			// cluster index, +0x14 bit 0 set). With a zero count or index -1 the camera is never inside a cell and
+			// every query ends "camera outside umbra view volume" (the renderer then draws everything).
+			// IWZ_TOME_LEGACY_CELL keeps the earlier values for A/B; IWZ_TOME_TILE34/CELL10/CELL14 (hex) override.
+			const bool legacy_cell = std::getenv("IWZ_TOME_LEGACY_CELL") != nullptr;
+			const auto hex_env = [](const char* name, std::uint32_t fallback)
+			{
+				const auto* v = std::getenv(name);
+				return v ? static_cast<std::uint32_t>(std::strtoul(v, nullptr, 16)) : fallback;
+			};
+			t.put<std::uint32_t>(tile + 0x34, hex_env("IWZ_TOME_TILE34", legacy_cell ? 1u : 0x00010001u));
 			const auto cell = t.block(36);
 			t.put<std::uint32_t>(cell + 0x0C, count);
-			t.put<std::uint32_t>(cell + 0x10, 0xFFFFFFFF);
-			t.put<std::uint32_t>(cell + 0x14, 0x80000000);
+			t.put<std::uint32_t>(cell + 0x10, hex_env("IWZ_TOME_CELL10", legacy_cell ? 0xFFFFFFFFu : 0u));
+			t.put<std::uint32_t>(cell + 0x14, hex_env("IWZ_TOME_CELL14", legacy_cell ? 0x80000000u : 0x80000001u));
 			t.put<std::uint32_t>(cell + 0x1C, 0x0000FFFF);
 			t.put<std::uint32_t>(cell + 0x20, 0xFFFFFFFF);
 			t.put<std::uint32_t>(tile + 0x38, cell - tile);
