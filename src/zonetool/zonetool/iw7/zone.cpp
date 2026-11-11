@@ -472,6 +472,25 @@ namespace zonetool::iw7
 		}
 	}
 
+	std::string zone_interface::asset_key(std::int32_t type, const std::string& name)
+	{
+		return std::to_string(type) + '' + name;
+	}
+
+	void zone_interface::push_asset(const std::shared_ptr<asset_interface>& asset)
+	{
+		m_asset_index.try_emplace(asset_key(asset->type(), asset->name()), m_assets.size());
+		m_assets.push_back(asset);
+	}
+
+	// Position of the first asset of this type and name, or m_assets.size(). Asset names are fixed once an asset is
+	// pushed (init sets them before), so the index answers what the linear scan answered.
+	std::size_t zone_interface::find_asset_index(std::int32_t type, const std::string& name)
+	{
+		const auto it = m_asset_index.find(asset_key(type, name));
+		return it == m_asset_index.end() ? m_assets.size() : it->second;
+	}
+
 	asset_interface* zone_interface::find_asset(std::int32_t type, const std::string& name)
 	{
 		if (name.empty())
@@ -479,15 +498,8 @@ namespace zonetool::iw7
 			return nullptr;
 		}
 
-		for (std::size_t idx = 0; idx < m_assets.size(); idx++)
-		{
-			if (m_assets[idx]->type() == type && m_assets[idx]->name() == name)
-			{
-				return m_assets[idx].get();
-			}
-		}
-
-		return nullptr;
+		const auto idx = find_asset_index(type, name);
+		return idx < m_assets.size() ? m_assets[idx].get() : nullptr;
 	}
 
 	void* zone_interface::get_asset_pointer(std::int32_t type, const std::string& name)
@@ -505,14 +517,12 @@ namespace zonetool::iw7
 		}
 
 		const std::uint64_t mask = 0x0000000000000000;
-		for (std::size_t idx = 0; idx < m_assets.size(); idx++)
+		const auto idx = std::min(find_asset_index(type, name), find_asset_index(type, ref_name));
+		if (idx < m_assets.size())
 		{
-			if (m_assets[idx]->type() == type && (m_assets[idx]->name() == name || m_assets[idx]->name() == ref_name))
-			{
-				auto ptr = mask | (static_cast<std::uint64_t>(XFILE_BLOCK_VIRTUAL) & 0x0F) << 32; // add stream index
-				ptr = (ptr + static_cast<std::uint32_t>((this->m_assetbase + ((16 * idx) + 8) + 1))); // add offset
-				return reinterpret_cast<void*>(ptr);
-			}
+			auto ptr = mask | (static_cast<std::uint64_t>(XFILE_BLOCK_VIRTUAL) & 0x0F) << 32; // add stream index
+			ptr = (ptr + static_cast<std::uint32_t>((this->m_assetbase + ((16 * idx) + 8) + 1))); // add offset
+			return reinterpret_cast<void*>(ptr);
 		}
 
 		return nullptr;
@@ -528,12 +538,9 @@ namespace zonetool::iw7
 		const std::string& name = get_asset_name(XAssetType(type), pointer);
 
 		// don't add asset if it already exists
-		for (std::size_t idx = 0; idx < m_assets.size(); idx++)
+		if (find_asset_index(type, name) < m_assets.size())
 		{
-			if (m_assets[idx]->type() == type && m_assets[idx]->name() == name)
-			{
-				return;
-			}
+			return;
 		}
 
 #define ADD_ASSET_PTR(__type__, ___) \
@@ -542,7 +549,7 @@ namespace zonetool::iw7
 			auto asset = std::make_shared < ___ >(); \
 			asset->init(pointer, this->m_zonemem.get()); \
 			asset->load_depending(this); \
-			m_assets.push_back(asset); \
+			push_asset(asset); \
 		}
 
 		try
@@ -588,7 +595,7 @@ namespace zonetool::iw7
 			asset->init(name, this->m_zonemem.get()); \
 			dump_enemy_pack_asset(static_cast<XAssetType>(type), asset->pointer()); \
 			asset->load_depending(this); \
-			m_assets.push_back(asset); \
+			push_asset(asset); \
 		}
 
 		try
@@ -1229,5 +1236,6 @@ namespace zonetool::iw7
 	{
 		// wipe all assets
 		m_assets.clear();
+		m_asset_index.clear();
 	}
 }
