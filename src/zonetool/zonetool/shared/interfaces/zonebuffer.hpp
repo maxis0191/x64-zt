@@ -229,6 +229,8 @@ namespace zonetool
 		std::stack<std::uint8_t> stream_stack_;
 
 		std::vector<const char*> script_strings_;
+		std::unordered_map<std::string, std::size_t> script_string_index_;
+		std::size_t script_string_null_ = std::numeric_limits<std::size_t>::max();
 
 		std::vector<std::size_t> depth_stencil_state_bits_;
 		std::vector<std::array<std::uint32_t, 4>> blend_state_bits_;

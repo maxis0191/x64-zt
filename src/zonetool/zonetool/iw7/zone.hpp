@@ -8,7 +8,14 @@ namespace zonetool::iw7
 		std::uintptr_t m_assetbase;
 		std::string name_;
 		std::vector<std::shared_ptr<asset_interface>> m_assets;
+		// (type, name) -> position of the first asset with that type and name in m_assets: the lookups below ran a
+		// linear scan with two string copies per asset, which made adding N assets cost O(N^2) (minutes on a map zone)
+		std::unordered_map<std::string, std::size_t> m_asset_index;
 		std::shared_ptr<zone_memory> m_zonemem;
+
+		static std::string asset_key(std::int32_t type, const std::string& name);
+		void push_asset(const std::shared_ptr<asset_interface>& asset);
+		std::size_t find_asset_index(std::int32_t type, const std::string& name);
 
 	public:
 		zone_interface(std::string name);

@@ -224,13 +224,16 @@ namespace zonetool
 
 	std::uint32_t zone_buffer::write_scriptstring(const char* str)
 	{
-		for (auto i = 0u; i < this->script_strings_.size(); i++)
+		// the first string with the same text (or the first null): an index instead of a scan of every string so far
+		if (!str)
 		{
-			if (this->script_strings_[i] == str || 
-				str && this->script_strings_[i] && !strcmp(this->script_strings_[i], str))
-			{
-				return i;
-			}
+			if (this->script_string_null_ != std::numeric_limits<std::size_t>::max()) return static_cast<std::uint32_t>(this->script_string_null_);
+			this->script_string_null_ = this->script_strings_.size();
+		}
+		else
+		{
+			const auto [it, added] = this->script_string_index_.try_emplace(str, this->script_strings_.size());
+			if (!added) return static_cast<std::uint32_t>(it->second);
 		}
 
 		this->script_strings_.push_back(str);
@@ -419,5 +422,7 @@ namespace zonetool
 	void zone_buffer::init_script_strings()
 	{
 		this->script_strings_.clear();
+		this->script_string_index_.clear();
+		this->script_string_null_ = std::numeric_limits<std::size_t>::max();
 	}
 }
