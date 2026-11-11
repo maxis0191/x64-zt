@@ -22,7 +22,11 @@ namespace iw7
 
 			while (!exit)
 			{
-				std::getline(std::cin, cmd);
+				if (!std::getline(std::cin, cmd))
+				{
+					// no input (closed or redirected standard input): stop reading instead of spinning on the failed stream
+					break;
+				}
 				if (ingame && !cmd.empty())
 				{
 					cmd.append("\n");
