@@ -2373,9 +2373,20 @@ namespace zonetool::iw7::iwzmap
 			ZONETOOL_INFO("iwzmap: %u clipmap static models, %zu with collision", n, colliding.size());
 		}
 
-		void build_clip(clipMap_t* c, const std::string& bsp, const std::string& hkx, const std::vector<smodel_source>& smodels, zone_memory* mem)
+		void build_clip(clipMap_t* c, const std::string& bsp, const std::string& hkx, const std::vector<smodel_source>& smodels, const world_source& src, zone_memory* mem)
 		{
 			c->name = mem->duplicate_string(bsp);
+			// The physics broadphase is the volume physics queries (traces, player movement, AI) are answered in; the
+			// template's (Spaceland: x -13600..8384, y -7864..8760) cut off the generated map's far rooms: Station Zero's
+			// Terminus floor beyond x 8384 / y 8760 was hit by no trace and players fell through it (11 Nov 2026). It is
+			// the template's box grown to hold the generated world with a margin.
+			for (auto a = 0; a < 3; a++)
+			{
+				c->broadphaseMin[a] = std::min(c->broadphaseMin[a], src.mins[a] - 1024.0f);
+				c->broadphaseMax[a] = std::max(c->broadphaseMax[a], src.maxs[a] + 1024.0f);
+			}
+			ZONETOOL_INFO("iwzmap: physics broadphase %.0f %.0f %.0f .. %.0f %.0f %.0f", c->broadphaseMin[0], c->broadphaseMin[1],
+				c->broadphaseMin[2], c->broadphaseMax[0], c->broadphaseMax[1], c->broadphaseMax[2]);
 			build_clip_smodels(c, smodels, mem);
 			c->mapEnts = name_stub<MapEnts>(mem, bsp);
 			c->havokWorldShapeDataSize = static_cast<unsigned int>(hkx.size());
@@ -2978,7 +2989,7 @@ namespace zonetool::iw7::iwzmap
 					}
 				}
 			}
-			build_clip(c, bsp, hkx, smodels, mem.get());
+			build_clip(c, bsp, hkx, smodels, src, mem.get());
 			build_ents(e, bsp, ents + light_ents, triggers, relocations, &me, src, mem.get());
 			build_nav(n, bsp, graph, mem.get());
 			if (!std::getenv("IWZ_CLEAR_DYNENTS"))
