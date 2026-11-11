@@ -2,6 +2,7 @@
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
 #include "iwzmap_lightmap.hpp"
+#include "iwzmap_smodel_rules.hpp"
 
 #include <array>
 #include <bit>
@@ -234,7 +235,8 @@ namespace zonetool::iw7::iwzmap
 		// Static models (smodels.txt): "<xmodel> x y z pitch yaw roll scale [noshadow] [nocollision] [cull=<units>]"
 		// ('#' starts a comment). Each line becomes a GfxWorld static model (light grid lit), an Umbra object
 		// (class 1) and, when the model has a collision shape, a clipmap static model.
-		// The XModel must be in the template dump (its own zone content). Engine-tested (iwz-stage2/smodels runs 3):
+		// The XModel is read from the template dump or, for a model the template map does not carry, from xmodel/ next to
+		// smodels.txt (the zone must then carry the model: kit import). Engine-tested (iwz-stage2/smodels runs 3):
 		// the clipmap static model blocks bullet traces only; physicstrace, playerphysicstrace, player movement (and
 		// so AI) go through it, as for stock props, whose player blocking comes from clip geometry. The generator adds
 		// that clip to the world Havok mesh and cuts the navmesh from smodels.bounds.json (written next to the
@@ -304,6 +306,15 @@ namespace zonetool::iw7::iwzmap
 				return list;
 			}
 			std::unordered_map<std::string, XModel*> models;
+			// a model that is not in the template dump (kit model of another map, authored model) is read from
+			// <folder of smodels.txt>/xmodel/<name>.xmb (+ <name>_lod*.hkx): the creator SDK links it there; the zone
+			// step gets the model itself from the kit import. The search paths are restored on every exit.
+			struct source_path
+			{
+				std::vector<std::string> saved = filesystem::get_search_paths();
+				explicit source_path(const std::string& dir) { if (!dir.empty()) filesystem::add_path(dir, true); }
+				~source_path() { filesystem::get_search_paths() = saved; }
+			} scope(std::filesystem::path(path).parent_path().string());
 			std::istringstream in(text);
 			auto line_no = 0;
 			for (std::string line; std::getline(in, line);)
@@ -327,7 +338,7 @@ namespace zonetool::iw7::iwzmap
 				{
 					xmodel parser;
 					models[s.model] = parser.parse(s.model, mem);
-					if (!models[s.model]) ZONETOOL_WARNING("iwzmap: static model %s is not in the template dump; skipped", s.model.data());
+					if (!models[s.model]) ZONETOOL_WARNING("iwzmap: static model %s is neither in the template dump nor in xmodel/ next to smodels.txt; skipped", s.model.data());
 				}
 				s.xmodel = models[s.model];
 				if (!s.xmodel) continue;
@@ -1276,55 +1287,35 @@ namespace zonetool::iw7::iwzmap
 		}
 
 		// Generated static models: each instance copies the draw instance of a template static model using the same
-		// XModel (else the first light-grid lit template instance) for the fields that are not placement or lighting,
-		// then is set to light grid lighting at its own place.
+		// XModel for the fields that are not placement or lighting, then is set to light grid lighting at its own place.
+		// A model with no light grid lit template instance (a kit model of another map, an authored model) starts from
+		// a neutral template instance and gets its model-dependent fields fitted (iwzmap_smodel_rules.hpp, which also
+		// names the cause of the earlier crash). IWZ_SMODEL_DONOR=<template model> copies that model's instance verbatim
+		// instead: the earlier behaviour, kept to reproduce the crash.
 		void build_smodels(GfxWorld* w, const std::vector<smodel_source>& list, zone_memory* mem)
 		{
+			namespace rules = smodel_rules;
 			const auto n = static_cast<unsigned int>(list.size());
 			auto& d = w->dpvs;
 			std::unordered_map<std::string, unsigned int> by_model;
-			int grid_template = -1;
 			for (auto i = 0u; i < d.smodelCount; i++)
 			{
 				const auto& dinst = d.smodelDrawInsts[i];
 				const auto lit_by_grid = (dinst.flags & STATIC_MODEL_FLAG_LIGHTGRID_LIGHTING) != 0;
-				if (lit_by_grid && grid_template < 0) grid_template = static_cast<int>(i);
 				if (lit_by_grid && dinst.model && dinst.model->name && !by_model.contains(dinst.model->name)) by_model[dinst.model->name] = i;
 			}
-			if (n && grid_template < 0) throw std::runtime_error("the template world has no light grid lit static model");
-
-			// lod/surface layout of a model ("numLods:s0,s1,..") and the first light grid lit template instance of each
-			// layout, scanned on first need (template models are parsed from the template dump into scratch memory)
-			auto model_shape = [](const XModel* m)
+			int forced_donor = -1;
+			if (const auto* forced = std::getenv("IWZ_SMODEL_DONOR"))
 			{
-				std::string k = std::to_string(m->numLods) + ":";
-				for (auto l = 0; l < m->numLods && l < 6; l++) k += std::to_string(m->lodInfo[l].numsurfs) + ",";
-				return k;
-			};
-			std::unordered_map<std::string, int> donor_by_shape;
-			bool donors_scanned = false;
-			auto find_shape_donor = [&](const std::string& want) -> int
-			{
-				if (!donors_scanned)
-				{
-					donors_scanned = true;
-					for (const auto& [name, idx] : by_model)
-					{
-						xmodel parser;
-						zone_memory scratch(64ull * 1024 * 1024);
-						const auto* m = parser.parse(name, &scratch);
-						if (m)
-						{
-							const auto k = model_shape(m);
-							if (!donor_by_shape.contains(k) || idx < static_cast<unsigned int>(donor_by_shape[k])) donor_by_shape[k] = static_cast<int>(idx);
-						}
-						scratch.free();
-					}
-					ZONETOOL_INFO("iwzmap: static model donors: %zu lod/surface layouts among %zu light grid lit template models", donor_by_shape.size(), by_model.size());
-				}
-				const auto it = donor_by_shape.find(want);
-				return it == donor_by_shape.end() ? -1 : it->second;
-			};
+				if (!by_model.contains(forced)) throw std::runtime_error(std::string("IWZ_SMODEL_DONOR: ") + forced + " has no light grid lit template instance");
+				forced_donor = static_cast<int>(by_model[forced]);
+				ZONETOOL_WARNING("iwzmap: IWZ_SMODEL_DONOR: twinless static models copy the draw instance of %s verbatim (firstMtlSkinIndex %u; crash reproduction)",
+					forced, d.smodelDrawInsts[forced_donor].firstMtlSkinIndex);
+			}
+			const auto neutral = rules::find_neutral_donor(d.smodelDrawInsts, d.smodelCount);
+			auto twinless_needed = false;
+			for (const auto& s : list) if (!by_model.contains(s.model)) twinless_needed = true;
+			if (twinless_needed && forced_donor < 0 && neutral < 0) throw std::runtime_error("the template world has no neutral light grid lit static model");
 
 			auto* insts = mem->allocate<GfxStaticModelInst>(std::max(n, 1u));
 			auto* draws = mem->allocate<GfxStaticModelDrawInst>(std::max(n, 1u));
@@ -1332,6 +1323,7 @@ namespace zonetool::iw7::iwzmap
 			auto* sorted = mem->allocate<unsigned short>(std::max(n, 1u));
 			std::unordered_map<std::string, XModel*> stubs;
 			auto copied = 0u;
+			auto twinless = 0u;
 			auto range_end = 0u;
 			const auto* unk_mode = std::getenv("IWZ_SMODEL_UNK");
 			const bool zero_unk = unk_mode && std::string(unk_mode) == "zero";
@@ -1340,28 +1332,26 @@ namespace zonetool::iw7::iwzmap
 			for (auto i = 0u; i < n; i++)
 			{
 				const auto& s = list[i];
-				auto t = by_model.contains(s.model) ? by_model[s.model] : static_cast<unsigned int>(grid_template);
-				if (by_model.contains(s.model)) copied++;
+				const auto twin = by_model.contains(s.model);
+				const auto t = twin ? by_model[s.model] : static_cast<unsigned int>(forced_donor >= 0 ? forced_donor : neutral);
+				if (twin) copied++;
 				else
 				{
-					// A model without a light grid lit template instance must borrow the draw instance of a template model
-					// with the SAME lod / surface layout: the draw instance carries per-surface data, and a donor with more
-					// surfaces made the draw pass read materials past the model's list (Station Zero g19-g21: access
-					// violation at iw7_ship+0xDCE6E7, donor zmb_bumper_cars_building_signage_backdrop, 107 surfaces).
-					const auto want = s.xmodel ? model_shape(s.xmodel) : std::string();
-					const auto donor = want.empty() ? -1 : find_shape_donor(want);
-					if (donor >= 0) t = static_cast<unsigned int>(donor);
-					else if (std::getenv("IWZ_SMODEL_ALLOW_SHAPE_MISMATCH"))
-						ZONETOOL_WARNING("iwzmap: static model %s (%s) has no template donor of the same lod/surface layout; using %s anyway (IWZ_SMODEL_ALLOW_SHAPE_MISMATCH)",
-							s.model.data(), want.data(), d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
-					else
-						throw std::runtime_error("static model " + s.model + " (lods/surfaces " + want + ") has no light grid lit template instance of its own "
-							"and no template donor with the same lod/surface layout: place it as a script_model (or set IWZ_SMODEL_ALLOW_SHAPE_MISMATCH)");
-					if (!stubs.contains(s.model)) ZONETOOL_INFO("iwzmap: static model %s (%s) borrows the draw instance of %s (same lod/surface layout)", s.model.data(),
-						want.data(), d.smodelDrawInsts[t].model ? d.smodelDrawInsts[t].model->name : "-");
+					twinless++;
+					if (!stubs.contains(s.model))
+					{
+						const auto& td = d.smodelDrawInsts[t];
+						const auto* xm = s.xmodel;
+						ZONETOOL_INFO("iwzmap: static model %s has no template instance: %s draw instance of %s (%u surfaces, lod0 surfIndex %u, skin %u%s)",
+							s.model.data(), forced_donor >= 0 ? "verbatim" : "fitted neutral", td.model ? td.model->name : "-",
+							xm ? xm->numsurfs : 0u, xm ? xm->lodInfo[0].surfIndex : 0u, forced_donor >= 0 ? td.firstMtlSkinIndex : 0u,
+							forced_donor >= 0 && xm && rules::skin_reads_past_materials(td.firstMtlSkinIndex, xm->lodInfo[0].surfIndex, xm->numsurfs)
+								? "; the draw pass will read past its materials" : "");
+					}
 				}
 				auto& dinst = draws[i];
 				dinst = d.smodelDrawInsts[t];
+				if (!twin && forced_donor < 0) rules::fit_to_model(dinst);
 				for (auto a = 0; a < 3; a++)
 				{
 					dinst.placement.origin[a] = s.origin[a];
@@ -1419,7 +1409,7 @@ namespace zonetool::iw7::iwzmap
 			d.smodelDrawInsts = n ? draws : nullptr;
 			d.sortedSmodelIndices = n ? sorted : nullptr;
 			d.lodData = lod;
-			ZONETOOL_INFO("iwzmap: %u static models (%u with a same-model template instance, %zu models, ranges %u)", n, copied, stubs.size(), range_end);
+			ZONETOOL_INFO("iwzmap: %u static models (%u with a same-model template instance, %u without, %zu models, ranges %u)", n, copied, twinless, stubs.size(), range_end);
 		}
 
 		// Primary lights: each generated light takes a static template light slot of the same type (and shadow
