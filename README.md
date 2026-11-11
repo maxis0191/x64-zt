@@ -103,6 +103,15 @@ Before this, a zone other than an enemy pack had no handler for the type: even a
 word and the model was written with no procedural bones (found on 11 Nov 2026 by the loader readback of the
 character pack, iw7-creator-sdk `build-charpack.ps1`).
 
+## Which assets the start zones hold (`-assetsloaded`)
+
+`-assetsloaded <in.csv> <out.csv>`: for each `type,name` line of `in.csv`, `out.csv` gets the line with `,loaded` (the
+database holds a real, non-default asset of that name) or `,missing`. Run with nothing else loaded, it answers for the
+zones the game loads at start and keeps for every map (code, `common`, `techsets_common`, ...). No `-dumpzone` can list
+those: a zone already loaded is not loaded, and so not dumped, again. The creator SDK's character pack
+(`build-charpack.ps1`) uses it to turn the effect materials, techsets and images it finds in no map dump into reference
+rows (11 Nov 2026: Pam's teleport effect).
+
 ## IW7 map compiler (`-iwzcompile`)
 IW7 has no map compiler of its own. `-iwzcompile` builds a new IW7 map (render geometry, Havok collision, nav graph, entities, lightmap, static models, door brush models, trigger volumes, darkness/named lights) around the world assets of a stock map, which is used as a template for sun, sky, light grid and reflection probes. It writes the regular dump layout, ready for `-buildzone`.
 

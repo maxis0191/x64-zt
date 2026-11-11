@@ -2867,6 +2867,42 @@ namespace zonetool::iw7
 
 						do_exit = true;
 					}
+					else if (args[i] == "-assetsloaded" && i + 2 < args.size())
+					{
+						// -assetsloaded <in.csv> <out.csv>: for each "type,name" line, whether the database holds a
+						// real (non-default) asset of that name now. Run first, it answers for the zones the game loads
+						// at start and keeps for every map (code, common, techsets_common, ...), which no -dumpzone
+						// can list: a zone already loaded is not loaded (and dumped) again.
+						wait_for_database();
+						std::string data{};
+						if (!utils::io::read_file(args[i + 1], &data))
+						{
+							ZONETOOL_ERROR("Could not read \"%s\"", args[i + 1].data());
+						}
+						else
+						{
+							std::string out{};
+							std::size_t loaded = 0, missing = 0;
+							for (auto line : utils::string::split(data, '\n'))
+							{
+								if (line.ends_with("\r")) line.pop_back();
+								const auto comma = line.find(',');
+								if (comma == std::string::npos) continue;
+								const auto type = type_to_int(line.substr(0, comma));
+								const auto name = line.substr(comma + 1);
+								if (type < 0 || name.empty()) continue;
+								const auto header = db_find_x_asset_header_safe(XAssetType(type), name);
+								const bool ok = header.data && !DB_IsXAssetDefault(XAssetType(type), name.data());
+								out += line + (ok ? ",loaded\n" : ",missing\n");
+								ok ? ++loaded : ++missing;
+							}
+							utils::io::write_file(args[i + 2], out);
+							ZONETOOL_INFO("Assets loaded at start: %zu of %zu (list %s)", loaded, loaded + missing, args[i + 2].data());
+						}
+						i += 2;
+
+						do_exit = true;
+					}
 				}
 			}
 
