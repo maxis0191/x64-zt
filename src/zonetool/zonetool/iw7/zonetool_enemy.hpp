@@ -35,7 +35,87 @@ namespace zonetool::iw7
             buffer->write(source, count);
             buffer->clear_pointer(destination);
         }
+        // Script strings of a parsed asset: the slots of the arrays this asset owns, filled from the dump's text.
+        void read_strings(assetmanager::reader& read, scr_string_t* slots, size_t count, zone_memory* memory)
+        {
+            for (size_t i = 0; i < count; ++i)
+            {
+                const char* value = read.read_string();
+                strings_[slots + i] = value ? memory->duplicate_string(value) : nullptr;
+            }
+        }
+        static void dump_strings(assetmanager::dumper& dump, const scr_string_t* slots, size_t count)
+        {
+            for (size_t i = 0; i < count; ++i)
+                dump.dump_string(slots[i] ? SL_ConvertToString(slots[i]) : nullptr);
+        }
+        static void check_counts(const XAnimProceduralBones* asset)
+        {
+            if (asset->numConstraints > 4096 || asset->numTargetBones > 4096 || asset->unk01_count > 4096 ||
+                asset->unk02_count > 4096 || asset->unk03_count > 4096)
+                throw std::runtime_error("IW7 procedural bone array count out of bounds");
+        }
+
+        // proceduralbones\<name>: the asset, its name, then each array followed by the text of its script strings
+        // (constraint source bones, target bones, the three strings of each unk01 entry, the one of each unk02 entry).
+        XAnimProceduralBones* parse(const std::string& name, zone_memory* memory)
+        {
+            assetmanager::reader read(memory);
+            if (!read.open("proceduralbones\\"s + name))
+                return nullptr;
+            ZONETOOL_INFO("Parsing proceduralbones \"%s\"...", name.data());
+            auto* asset = read.read_single<XAnimProceduralBones>();
+            asset->name = read.read_string();
+            check_counts(asset);
+            asset->constraints = read.read_array<XAnimConstraint>();
+            for (size_t i = 0; i < asset->numConstraints; ++i)
+                read_strings(read, asset->constraints[i].sourceBoneNames, 2, memory);
+            asset->targetBoneNames = asset->numTargetBones ? memory->allocate<scr_string_t>(asset->numTargetBones) : nullptr;
+            read_strings(read, asset->targetBoneNames, asset->numTargetBones, memory);
+            asset->unk01 = read.read_array<unk_1453E1E68>();
+            for (size_t i = 0; i < asset->unk01_count; ++i)
+            {
+                read_strings(read, &asset->unk01[i].unk01, 1, memory);
+                read_strings(read, &asset->unk01[i].unk02, 1, memory);
+                read_strings(read, &asset->unk01[i].unk03, 1, memory);
+            }
+            asset->unk02 = read.read_array<unk_1453E1E30>();
+            for (size_t i = 0; i < asset->unk02_count; ++i)
+                read_strings(read, &asset->unk02[i].unk01, 1, memory);
+            asset->unk03 = read.read_array<unk_1453E1EA8>();
+            read.close();
+            if ((asset->numConstraints && !asset->constraints) || (asset->unk01_count && !asset->unk01) ||
+                (asset->unk02_count && !asset->unk02) || (asset->unk03_count && !asset->unk03))
+                throw std::runtime_error("IW7 procedural bone dump is missing an array: " + name);
+            return asset;
+        }
     public:
+        static void dump(XAnimProceduralBones* asset)
+        {
+            assetmanager::dumper dump;
+            if (!dump.open("proceduralbones\\"s + asset->name))
+                return;
+            dump.dump_single(asset);
+            dump.dump_string(asset->name);
+            dump.dump_array(asset->constraints, asset->numConstraints);
+            for (size_t i = 0; i < asset->numConstraints; ++i)
+                dump_strings(dump, asset->constraints[i].sourceBoneNames, 2);
+            dump_strings(dump, asset->targetBoneNames, asset->numTargetBones);
+            dump.dump_array(asset->unk01, asset->unk01_count);
+            for (size_t i = 0; i < asset->unk01_count; ++i)
+            {
+                dump_strings(dump, &asset->unk01[i].unk01, 1);
+                dump_strings(dump, &asset->unk01[i].unk02, 1);
+                dump_strings(dump, &asset->unk01[i].unk03, 1);
+            }
+            dump.dump_array(asset->unk02, asset->unk02_count);
+            for (size_t i = 0; i < asset->unk02_count; ++i)
+                dump_strings(dump, &asset->unk02[i].unk01, 1);
+            dump.dump_array(asset->unk03, asset->unk03_count);
+            dump.close();
+        }
+
+        // Any zone: a reference, a dump on disk (proceduralbones\<name>), or the live asset of a loaded donor zone.
         void init(const std::string& name, zone_memory* memory) override
         {
             name_ = name;
@@ -46,10 +126,18 @@ namespace zonetool::iw7
                 return;
             }
             if (!filesystem::get_fastfile().starts_with("paris_enemy_"))
-                throw std::runtime_error("IW7 live procedural bone serialization is scoped to enemy packs");
+            {
+                asset_ = parse(name, memory);
+                if (asset_)
+                {
+                    asset_->name = memory->duplicate_string(name_);
+                    return;
+                }
+            }
             const auto* source = db_find_x_asset_header_safe(ASSET_TYPE_XANIM_PROCEDURALBONES, name).proceduralBones;
             if (!source || !source->name || name != source->name || DB_IsXAssetDefault(ASSET_TYPE_XANIM_PROCEDURALBONES, name.c_str()))
-                throw std::runtime_error("IW7 procedural bone donor asset is missing");
+                throw std::runtime_error("IW7 procedural bones have no source: no proceduralbones\\" + name +
+                    " dump and no loaded donor zone defines them");
             asset_ = clone(source, 1, memory);
             asset_->name = memory->duplicate_string(name_);
             asset_->constraints = clone(source->constraints, source->numConstraints, memory);

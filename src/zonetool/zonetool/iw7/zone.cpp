@@ -605,8 +605,11 @@ namespace zonetool::iw7
 			{
 				ADD_ASSET(ASSET_TYPE_ANIMCLASS, iw7_anim_class);
 				ADD_ASSET(ASSET_TYPE_BEHAVIOR_TREE, iw7_behavior_tree);
-				ADD_ASSET(ASSET_TYPE_XANIM_PROCEDURALBONES, iw7_procedural_bones);
 			}
+			// Procedural bones (twist helpers of character models) in any zone: a reference, a proceduralbones\<name>
+			// dump, or a loaded donor. Before this every other zone dropped them, references included: the model was
+			// written with none.
+			ADD_ASSET(ASSET_TYPE_XANIM_PROCEDURALBONES, iw7_procedural_bones);
 			ADD_ASSET(ASSET_TYPE_DDL, ddl);
 			ADD_ASSET(ASSET_TYPE_FX, fx_effect_def);
 			ADD_ASSET(ASSET_TYPE_PARTICLE_SIM_ANIMATION, fx_particle_sim_animation);

@@ -3,6 +3,7 @@
 
 #include "converter/converter.hpp"
 #include "assets/physics_asset.hpp"
+#include "zonetool_enemy.hpp"
 #include "assets/sound_bank_subset_rules.hpp"
 #include "common/havok.hpp"
 #include "iwzmap/iwzmap.hpp"
@@ -251,6 +252,7 @@ namespace zonetool::iw7
 			DUMP_ASSET(ASSET_TYPE_SOUND_BANK, sound_bank, SndBank);
 			//DUMP_ASSET(ASSET_TYPE_SOUND_BANK_TRANSIENT, sound_bank_transient, SndBankTransient);
 
+			DUMP_ASSET(ASSET_TYPE_XANIM_PROCEDURALBONES, iw7_procedural_bones, XAnimProceduralBones);
 			DUMP_ASSET(ASSET_TYPE_PHYSICSASSET, physics_asset, PhysicsAsset);
 			DUMP_ASSET(ASSET_TYPE_PHYSICS_FX_PIPELINE, physics_fx_pipeline, PhysicsFXPipeline);
 			DUMP_ASSET(ASSET_TYPE_PHYSICS_FX_SHAPE, physics_fx_shape, PhysicsFXShape);

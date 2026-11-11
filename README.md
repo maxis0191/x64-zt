@@ -88,6 +88,21 @@ These commands use the installed game's local IW7 database. Keep extracted rows,
   * `skip common`: Skips common zones when dumping a map, can be `true` or `false`.
   * `target game`: The game to convert the assets to.
 
+## IW7 procedural bones in any zone
+
+`proceduralbones` (`XAnimProceduralBones`: the twist-helper constraints a character model names, such as
+`procedurual_male_undershoulder`) is handled in every zone, not only in `paris_enemy_*` packs:
+
+* dump: `-dumpzonetypes <zone> proceduralbones` writes `dump/<zone>/proceduralbones/<name>` (the asset, its name, each
+  array, and after each array the text of its script strings: constraint source bones, target bones, the three
+  strings of an `unk01` entry, the one of an `unk02` entry);
+* build: a model's procedural bones come from a `proceduralbones,,<name>` reference row, from
+  `zonetool/<zone>/proceduralbones/<name>`, or from a loaded donor zone (enemy packs keep their live clone).
+
+Before this, a zone other than an enemy pack had no handler for the type: even a reference row was dropped without a
+word and the model was written with no procedural bones (found on 11 Nov 2026 by the loader readback of the
+character pack, iw7-creator-sdk `build-charpack.ps1`).
+
 ## IW7 map compiler (`-iwzcompile`)
 IW7 has no map compiler of its own. `-iwzcompile` builds a new IW7 map (render geometry, Havok collision, nav graph, entities, lightmap, static models, door brush models, trigger volumes, darkness/named lights) around the world assets of a stock map, which is used as a template for sun, sky, light grid and reflection probes. It writes the regular dump layout, ready for `-buildzone`.
 
