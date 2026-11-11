@@ -45,10 +45,12 @@ namespace zonetool::iw7::iwzmap
 {
 	namespace
 	{
-		// Conservative Umbra tome (format 20, the version IW7 and IW8 ship): one tile holding one cell that lists
-		// every object, each object's bounds spanning the whole scene, so the Umbra query never culls a generated
-		// object; the renderer still frustum culls. Object user ids carry the class in bits 28-31
-		// (0 world surface, 5 reflection probe instance).
+		// Generated Umbra tome (format 20, the version IW7 and IW8 ship): one tile holding one cell that lists
+		// every object. The renderer has no frustum or distance test of its own for static models: what the
+		// Umbra query returns is drawn. Each object therefore carries its own bounds and cull distance (see
+		// tome_object); IWZ_TOME=conservative gives every object the scene's bounds and no distance (the earlier
+		// behaviour: nothing is culled). Object user ids carry the class in bits 28-31
+		// (0 world surface, 1 static model, 4 primary light, 5 reflection probe instance).
 		// Layout: header 0x170 (version 0xD6000014, CRC32C of [8, end) at +4, size at +8), 16-byte aligned blocks.
 		class tome_writer
 		{
@@ -92,9 +94,22 @@ namespace zonetool::iw7::iwzmap
 			return ~crc;
 		}
 
-		std::string build_conservative_tome(const std::vector<std::uint32_t>& user_ids, const float* scene_mins, const float* scene_maxs)
+		// One Umbra object: its user id, its world bounds and the squared distance beyond which it is not drawn.
+		// The shipped tomes (cp_zmb, all 24,053 objects) store per object its own bounds (static model bounds equal
+		// to GfxStaticModelInst::bounds to 0.001 unit) and a distance box (the same bounds, 0, the same bounds,
+		// cullDist squared; FLT_MAX for objects that are never distance culled). Umbra frustum and distance culls
+		// with these: a scene-sized box makes every object visible from everywhere.
+		struct tome_object
 		{
-			const auto count = static_cast<std::uint32_t>(user_ids.size());
+			std::uint32_t user_id;
+			float mins[3];
+			float maxs[3];
+			float far_squared;
+		};
+
+		std::string build_tome(const std::vector<tome_object>& objects, const float* scene_mins, const float* scene_maxs)
+		{
+			const auto count = static_cast<std::uint32_t>(objects.size());
 			if (!count) throw std::runtime_error("an Umbra tome needs at least one object");
 			auto width = 1u;
 			while (width < 31 && (1u << width) < count) width++;
@@ -125,22 +140,23 @@ namespace zonetool::iw7::iwzmap
 			t.put<std::uint32_t>(0x30, top_tree);
 			t.put<std::uint32_t>(0x34, top_map);
 
-			// per-object bounds (min, max) and distance boxes (min, 0, max, +inf), all scene sized
+			// per-object bounds (min, max) and distance boxes (min, 0, max, far squared)
 			const auto bounds = t.block(static_cast<std::size_t>(count) * 24);
 			const auto distances = t.block(static_cast<std::size_t>(count) * 32);
 			for (auto i = 0u; i < count; i++)
 			{
-				t.put_bounds(bounds + i * 24, mins, maxs);
-				std::memcpy(t.data().data() + distances + i * 32, mins, 12);
+				const auto& o = objects[i];
+				t.put_bounds(bounds + i * 24, o.mins, o.maxs);
+				std::memcpy(t.data().data() + distances + i * 32, o.mins, 12);
 				t.put<float>(distances + i * 32 + 12, 0.0f);
-				std::memcpy(t.data().data() + distances + i * 32 + 16, maxs, 12);
-				t.put<float>(distances + i * 32 + 28, std::numeric_limits<float>::infinity());
+				std::memcpy(t.data().data() + distances + i * 32 + 16, o.maxs, 12);
+				t.put<float>(distances + i * 32 + 28, o.far_squared);
 			}
 			t.put<std::uint32_t>(0x44, bounds);
 			t.put<std::uint32_t>(0x48, distances);
 
 			const auto ids = t.block(static_cast<std::size_t>(count) * 4);
-			for (auto i = 0u; i < count; i++) t.put<std::uint32_t>(ids + i * 4, user_ids[i]);
+			for (auto i = 0u; i < count; i++) t.put<std::uint32_t>(ids + i * 4, objects[i].user_id);
 			t.put<std::uint32_t>(0x50, ids);
 
 			// the cell's object list: indices 0..count-1, bit packed with the index width
@@ -2188,18 +2204,48 @@ namespace zonetool::iw7::iwzmap
 				// instances, whose vis bits come from the query as well)
 				if (std::getenv("IWZ_GEN_TOME"))
 				{
-					std::vector<std::uint32_t> user_ids;
-					for (auto k = 0u; k < own; k++) user_ids.push_back(k);
-					for (auto k = 0u; k < w->dpvs.smodelCount; k++) user_ids.push_back(0x10000000u + k);
-					for (const auto slot : light_slots) user_ids.push_back(0x40000000u + slot);
+					const auto* tome_mode = std::getenv("IWZ_TOME");
+					const bool conservative = tome_mode && std::string(tome_mode) == "conservative";
+					float scene_lo[3], scene_hi[3];
+					for (auto a = 0; a < 3; a++) { scene_lo[a] = src.mins[a] - 64.0f; scene_hi[a] = src.maxs[a] + 64.0f; }
+					constexpr auto never = std::numeric_limits<float>::max();
+					std::vector<tome_object> objects;
+					const auto add = [&](std::uint32_t id, const Bounds* b, float far_squared)
+					{
+						tome_object o{};
+						o.user_id = id;
+						for (auto a = 0; a < 3; a++)
+						{
+							o.mins[a] = (b && !conservative) ? b->midPoint[a] - b->halfSize[a] : scene_lo[a];
+							o.maxs[a] = (b && !conservative) ? b->midPoint[a] + b->halfSize[a] : scene_hi[a];
+						}
+						o.far_squared = conservative ? std::numeric_limits<float>::infinity() : far_squared;
+						objects.push_back(o);
+					};
+					// world surfaces: own bounds, never distance culled (the shipped tome does the same)
+					for (auto k = 0u; k < own; k++)
+					{
+						const auto b = make_bounds(src.surfaces[k].mins, src.surfaces[k].maxs);
+						add(k, &b, never);
+					}
+					// static models: own bounds, cullDist of the draw instance (0 = never)
+					auto distance_culled = 0u;
+					for (auto k = 0u; k < w->dpvs.smodelCount; k++)
+					{
+						const auto cull = static_cast<float>(w->dpvs.smodelDrawInsts[k].cullDist);
+						if (cull > 0.0f) distance_culled++;
+						add(0x10000000u + k, &w->dpvs.smodelInsts[k].bounds, cull > 0.0f ? cull * cull : never);
+					}
+					// lights and probe instances: scene sized (a light's reach is not its position)
+					for (const auto slot : light_slots) add(0x40000000u + slot, nullptr, never);
 					const auto probes = std::getenv("IWZ_TOME_NO_PROBES") ? 0u : w->draw.reflectionProbeData.reflectionProbeInstanceCount;
-					for (auto p = 0u; p < probes; p++) user_ids.push_back(0x50000000u + p);
-					const auto tome = build_conservative_tome(user_ids, src.mins, src.maxs);
+					for (auto p = 0u; p < probes; p++) add(0x50000000u + p, nullptr, never);
+					const auto tome = build_tome(objects, src.mins, src.maxs);
 					w->umbraTomeSize = static_cast<unsigned int>(tome.size());
 					w->umbraTomeData = mem->allocate<char>(tome.size());
 					std::memcpy(w->umbraTomeData, tome.data(), tome.size());
-					ZONETOOL_INFO("iwzmap: generated conservative Umbra tome (%u bytes, %u surfaces, %u static models, %zu primary lights, %u probe instances)",
-						w->umbraTomeSize, own, w->dpvs.smodelCount, light_slots.size(), probes);
+					ZONETOOL_INFO("iwzmap: generated %s Umbra tome (%u bytes, %u surfaces, %u static models of which %u distance culled, %zu primary lights, %u probe instances)",
+						conservative ? "conservative" : "culling", w->umbraTomeSize, own, w->dpvs.smodelCount, conservative ? 0u : distance_culled, light_slots.size(), probes);
 					if (const auto* out = std::getenv("IWZ_DUMP_TOME")) utils::io::write_file(std::string(out) + ".gen.tome", tome);
 				}
 			}
