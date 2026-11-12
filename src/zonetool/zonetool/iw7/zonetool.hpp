@@ -17,6 +17,7 @@
 #include "assets/fxeffectdef.hpp"
 #include "assets/fxparticlesimanimation.hpp"
 #include "assets/gesture.hpp"
+#include "assets/playeranim.hpp"
 #include "assets/gfximage.hpp"
 #include "assets/gfxlightdef.hpp"
 #include "assets/gfxlightmap.hpp"
