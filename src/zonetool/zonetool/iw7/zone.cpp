@@ -1168,9 +1168,16 @@ namespace zonetool::iw7
 		std::uintptr_t zero = 0; // data_none
 
 		// write asset types to header
+		std::string prepare_log;
+		const bool want_prepare_log = std::getenv("ZT_WRITE_LOG") != nullptr;
 		for (std::size_t i = 0; i < m_assets.size(); i++)
 		{
 			m_assets[i]->prepare(buf, this->m_zonemem.get());
+			if (want_prepare_log)
+			{
+				// the state tables after this asset's prepare: the first asset where two builds' counts part is the one that differs
+				prepare_log += utils::string::va("P%c%d%c%s%c%zu%c%zu%c", 9, m_assets[i]->type(), 9, m_assets[i]->name().data(), 9, buf->depthstencilstatebit_count(), 9, buf->blendstatebits_count(), 10);
+			}
 		}
 		ZONETOOL_INFO("[ TIMING ] zone \"%s\": images + prepare of %zu assets %.3f s", this->name_.data(), m_assets.size(), clock.lap());
 
@@ -1466,7 +1473,7 @@ namespace zonetool::iw7
 			{
 				write_log_text += utils::string::va("S\t%zu\t%s\n", i, buf->get_scriptstring(i));
 			}
-			utils::io::write_file(write_log, write_log_text);
+			utils::io::write_file(write_log, prepare_log + write_log_text);
 		}
 		ZONETOOL_INFO("[ TIMING ] zone \"%s\": asset write loop %.3f s", this->name_.data(), clock.lap());
 		for (const auto& [type, v] : write_by_type)
