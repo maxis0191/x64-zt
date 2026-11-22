@@ -10,6 +10,8 @@
 #include <zlib.h>
 #include <lz4.h>
 #include <lz4hc.h>
+#include <chrono>
+#include <map>
 
 #define FF_MAGIC_SIGNED "IWff0100"
 #define FF_MAGIC_UNSIGNED "IWffu100"
@@ -43,6 +45,16 @@ static_assert(COMPRESS_BLOCK_TYPE == COMPRESS_BLOCK_TYPE_LZ4 || COMPRESSOR == CO
 
 namespace zonetool::iw7
 {
+	namespace
+	{
+		// wall clock of the zone step's parts (the lines "[ TIMING ]" of the log; the table of docs/BUILD-SERVER.md)
+		struct phase_clock
+		{
+			std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+			double lap() { const auto n = std::chrono::steady_clock::now(); const auto d = std::chrono::duration<double>(n - t).count(); t = n; return d; }
+		};
+	}
+
 	namespace compression::iwc
 	{
 		size_t align_value(size_t value, unsigned int alignment)
@@ -750,6 +762,7 @@ namespace zonetool::iw7
 		buf->init_streams(MAX_XFILE_COUNT);
 
 		[[maybe_unused]] const auto start_time = GetTickCount64();
+		phase_clock clock;
 
 		ZONETOOL_INFO("Compiling fastfile \"%s\"...", this->name_.data());
 
@@ -782,6 +795,7 @@ namespace zonetool::iw7
 		{
 			m_assets[i]->prepare(buf, this->m_zonemem.get());
 		}
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": images + prepare of %zu assets %.3f s", this->name_.data(), m_assets.size(), clock.lap());
 
 		buf->push_stream(XFILE_BLOCK_TEMP);
 
@@ -1031,12 +1045,16 @@ namespace zonetool::iw7
 			buf->write(&following);
 		}
 
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": header and globals %.3f s", this->name_.data(), clock.lap());
+
 		// write assets
+		std::map<int, std::pair<double, std::size_t>> write_by_type;
 		for (auto& asset : m_assets)
 		{
 #ifdef DEBUG
 			ZONETOOL_INFO("writing asset \"%s\" of type %s...", asset->name().data(), type_to_string(XAssetType(asset->type())));
 #endif
+			phase_clock one;
 
 			// push stream
 			buf->push_stream(XFILE_BLOCK_TEMP);
@@ -1047,6 +1065,18 @@ namespace zonetool::iw7
 
 			// pop stream
 			buf->pop_stream();
+
+			auto& slot = write_by_type[asset->type()];
+			slot.first += one.lap();
+			slot.second++;
+		}
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": asset write loop %.3f s", this->name_.data(), clock.lap());
+		for (const auto& [type, v] : write_by_type)
+		{
+			if (v.first >= 0.05)
+			{
+				ZONETOOL_INFO("[ TIMING ] zone \"%s\":   write %s: %zu assets %.3f s", this->name_.data(), type_to_string(XAssetType(type)), v.second, v.first);
+			}
 		}
 
 		// pop stream
@@ -1057,6 +1087,8 @@ namespace zonetool::iw7
 		buf->save("zonetool\\_debug\\" + this->name_ + ".zone", false);
 #endif
 
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": zone buffer %zu bytes", this->name_.data(), static_cast<std::size_t>(buf->size()));
+		clock.lap();
 		// Compress buffer
 #if (COMPRESSOR == COMPRESSOR_BLOCK)
 #ifdef FF_SIGNED
@@ -1078,6 +1110,7 @@ namespace zonetool::iw7
 		compress_header.compressor = DB_COMPRESSOR_PASSTHROUGH;
 #endif
 
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": compression %.3f s", this->name_.data(), clock.lap());
 		// Generate FF header
 		XFileHeader header{};
 		strcat(header.magic, FF_MAGIC);
@@ -1216,9 +1249,11 @@ namespace zonetool::iw7
 
 		fastfile.write(buf_output, buf_output_size);
 		assert(fastfile.size() == header.fileLen);
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": fastfile assembly (copy) %.3f s", this->name_.data(), clock.lap());
 
 		std::string path = this->name_ + ".ff";
 		fastfile.save(path);
+		ZONETOOL_INFO("[ TIMING ] zone \"%s\": file write %.3f s", this->name_.data(), clock.lap());
 
 		ZONETOOL_INFO("Successfully compiled fastfile \"%s\"!", this->name_.data());
 		ZONETOOL_INFO("Compiling took %llu msec.", (GetTickCount64() - start_time));

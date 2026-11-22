@@ -972,8 +972,10 @@ namespace zonetool::iw7
 			}
 			if (row->fields[0] == "require"s)
 			{
+				const auto require_start = std::chrono::steady_clock::now();
 				load_zone(row->fields[1], DB_LOAD_ASYNC);
 				wait_for_database();
+				ZONETOOL_INFO("[ TIMING ] require \"%s\": %.3f s", row->fields[1], std::chrono::duration<double>(std::chrono::steady_clock::now() - require_start).count());
 			}
 			else if (row->fields[0] == "include"s)
 			{
@@ -1184,9 +1186,11 @@ namespace zonetool::iw7
 
 		zonetool::taskbar::set_indeterminate();
 
+		const auto parse_start = std::chrono::steady_clock::now();
 		try
 		{
 			parse_csv_file(zone.get(), fastfile, fastfile);
+			ZONETOOL_INFO("[ TIMING ] zone \"%s\": csv and asset parse (incl. required zones) %.3f s", fastfile.data(), std::chrono::duration<double>(std::chrono::steady_clock::now() - parse_start).count());
 		}
 		catch (std::exception& ex)
 		{
