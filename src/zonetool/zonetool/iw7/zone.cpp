@@ -913,7 +913,13 @@ namespace zonetool::iw7
 		auto add_cached = [&](auto* tag)
 		{
 			using T = std::remove_pointer_t<decltype(tag)>;
-			const auto cached = asset_cache::active() && !name_.starts_with("paris_enemy_");
+			// the world assets (the generated map: aipaths, clipmap, ...) are parsed from the compile's output on every build and some
+			// of them rewrite their own source tree when they are written (path_data::write: access violation on a second write of the
+			// same parsed object, measured), so they are never taken from the cache
+			const auto world_type = type == ASSET_TYPE_PATHDATA || type == ASSET_TYPE_CLIPMAP || type == ASSET_TYPE_COMWORLD || type == ASSET_TYPE_FXWORLD ||
+				type == ASSET_TYPE_GFXWORLD || type == ASSET_TYPE_GFXWORLD_TRANSIENT_ZONE || type == ASSET_TYPE_GLASSWORLD ||
+				type == ASSET_TYPE_MAP_ENTS || type == ASSET_TYPE_NAVMESH;
+			const auto cached = asset_cache::active() && !world_type && !name_.starts_with("paris_enemy_");
 			const auto key = asset_key(type, name);
 			if (cached)
 			{
@@ -1407,6 +1413,8 @@ namespace zonetool::iw7
 		ZONETOOL_INFO("[ TIMING ] zone \"%s\": header and globals %.3f s", this->name_.data(), clock.lap());
 
 		// write assets
+		const char* const write_log = std::getenv("ZT_WRITE_LOG");
+		std::string write_log_text;
 		std::map<int, std::pair<double, std::size_t>> write_by_type;
 		for (auto& asset : m_assets)
 		{
@@ -1419,15 +1427,34 @@ namespace zonetool::iw7
 			buf->push_stream(XFILE_BLOCK_TEMP);
 			buf->align(7);
 
+			const auto write_from = write_log ? buf->size() : 0;
+
 			// write asset
 			asset->write(this, buf);
 
 			// pop stream
 			buf->pop_stream();
 
+			if (write_log)
+			{
+				// ZT_WRITE_LOG=<file>: one line per asset (type, name, bytes, hash of the bytes), then the script strings:
+				// the comparison of two builds names the assets whose output differs (cold against warm server, A against A)
+				std::uint64_t h = 1469598103934665603ull;
+				for (auto at = write_from; at < buf->size(); at++) h = (h ^ buf->buffer()[at]) * 1099511628211ull;
+				write_log_text += utils::string::va("A\t%d\t%s\t%zu\t%016llx\n", asset->type(), asset->name().data(), buf->size() - write_from, h);
+			}
+
 			auto& slot = write_by_type[asset->type()];
 			slot.first += one.lap();
 			slot.second++;
+		}
+		if (write_log)
+		{
+			for (std::size_t i = 0; i < buf->scriptstring_count(); i++)
+			{
+				write_log_text += utils::string::va("S\t%zu\t%s\n", i, buf->get_scriptstring(i));
+			}
+			utils::io::write_file(write_log, write_log_text);
 		}
 		ZONETOOL_INFO("[ TIMING ] zone \"%s\": asset write loop %.3f s", this->name_.data(), clock.lap());
 		for (const auto& [type, v] : write_by_type)
