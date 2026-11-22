@@ -210,6 +210,17 @@ namespace zonetool::iw7
 		template struct member_ref<mem_pos_tag, &zone_memory::mem_pos_>;
 		std::size_t arena_used() { return g_arena ? (g_arena.get()->*member_of(mem_pos_tag{})) : 0; }
 
+		struct mem_pool_tag { using type = LPVOID zone_memory::*; friend type member_of(mem_pool_tag); };
+		template struct member_ref<mem_pool_tag, &zone_memory::memory_pool_>;
+		// is the address inside the cache's own arena (and not in the memory of a loaded game zone, which a zone unload frees)?
+		bool in_arena(const void* p)
+		{
+			if (!g_arena || !p) return false;
+			const auto base = reinterpret_cast<std::uintptr_t>(g_arena.get()->*member_of(mem_pool_tag{}));
+			const auto at = reinterpret_cast<std::uintptr_t>(p);
+			return at >= base && at < base + MAX_ZONE_SIZE;
+		}
+
 		std::string stats()
 		{
 			return utils::string::va("%zu entries, %zu files, arena %.0f MB, hits %zu, misses %zu (of which stale %zu), not cacheable %zu", g_table.size(),
@@ -950,7 +961,8 @@ namespace zonetool::iw7
 				asset->load_depending(this);
 				if (cached)
 				{
-					if (scope.f.unsafe)
+					// an asset that took a game zone's memory (the default asset of a missing file) dies with that zone
+					if (scope.f.unsafe || (asset->pointer() && !asset_cache::in_arena(asset->pointer())))
 					{
 						asset_cache::g_uncacheable++;
 						asset_cache::g_table.erase(key);

@@ -2622,6 +2622,13 @@ namespace zonetool::iw7
 			else if (cmd == "compile")
 			{
 				const auto& args = req.at("args");
+				// The compile reads script string ids of the template's stored node data through the engine's string table
+				// (path_data::dump: SL_ConvertToString). A fresh process has only the engine's own zones loaded; after a zone build the
+				// required techset zones are loaded too and the same ids give other strings (108 stray strings in the aipaths file,
+				// measured). The zones this tool loaded are unloaded first so the compile sees what a fresh process sees; the next zone
+				// build loads them again (0.4 s for the nine of a map).
+				unload_zones();
+				wait_for_database();
 				answer["ok"] = iwzmap::compile(args.at(0), args.at(1), args.at(2), args.at(3));
 			}
 			else if (cmd == "buildzone")
