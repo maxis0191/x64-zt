@@ -1634,6 +1634,35 @@ namespace zonetool::iw7::iwzmap
 			// static models that the generated world does not have
 			if (w->shadowGeomOptimized && !std::getenv("IWZ_KEEP_TEMPLATE_SHADOWGEOM"))
 				for (auto k = 0u; k < w->primaryLightCount; k++) w->shadowGeomOptimized[k] = {};
+
+			// reference culling mesh: an unused template omni slot's sphere mesh (32 vertices around the light at
+			// 1.2-1.4 x its radius on cp_zmb), scaled onto every generated light. IWZ_TEMPLATE_LIGHT_SHAPES=1 keeps the
+			// old behaviour (each slot's own template shapes moved and scaled), for A/B frames.
+			std::set<unsigned> used;
+			for (const auto& l : lights) used.insert(l.slot);
+			auto ref = ~0u;
+			for (auto k = 0u; w->frustumLights && k < w->primaryLightCount && ref == ~0u; k++)
+			{
+				const auto& f = w->frustumLights[k];
+				if (used.count(k) || cw->primaryLights[k].type != GFX_LIGHT_TYPE_OMNI || !(cw->primaryLights[k].radius > 0.0f)) continue;
+				if (f.vertexCount != 32 || !f.vertices || !f.indices || !f.indexCount) continue;
+				if (w->lightViewFrustums && w->lightViewFrustums[k].planeCount) continue;
+				ref = k;
+			}
+			const auto own_shapes = ref != ~0u && !std::getenv("IWZ_TEMPLATE_LIGHT_SHAPES");
+			std::vector<char> ref_vertices;
+			std::vector<unsigned short> ref_indices;
+			float ref_origin[3]{}, ref_radius = 1.0f;
+			if (ref != ~0u)
+			{
+				const auto& f = w->frustumLights[ref];
+				ref_vertices.assign(f.vertices, f.vertices + 32ull * f.vertexCount);
+				ref_indices.assign(f.indices, f.indices + f.indexCount);
+				for (auto a = 0; a < 3; a++) ref_origin[a] = cw->primaryLights[ref].origin[a];
+				ref_radius = cw->primaryLights[ref].radius;
+			}
+			ZONETOOL_INFO("iwzmap: light culling shapes: %s (reference omni slot %d, radius %.0f)", own_shapes ? "own" : "template (moved)",
+				ref == ~0u ? -1 : static_cast<int>(ref), ref_radius);
 			for (auto li = 0u; li < lights.size(); li++)
 			{
 				const auto& l = lights[li];
@@ -1651,7 +1680,57 @@ namespace zonetool::iw7::iwzmap
 						t.r[a][b] = l.spot ? fn[a][0] * fo[b][0] + fn[a][1] * fo[b][1] + fn[a][2] * fo[b][2] : (a == b ? 1.0 : 0.0);
 
 				auto moved_vertices = 0u;
-				if (w->frustumLights)
+				if (own_shapes)
+				{
+					// the light's own culling shapes (the template's are clipped to the template's rooms and, for a
+					// spot slot, are a cone: an omni light or a wider spot placed there is cut along their outline)
+					auto& f = w->frustumLights[k];
+					const auto& rf = w->frustumLights[ref];
+					const auto s = n.radius / ref_radius;
+					auto* verts = mem->allocate<char>(32ull * rf.vertexCount);
+					std::memcpy(verts, ref_vertices.data(), 32ull * rf.vertexCount);
+					for (auto v = 0u; v < rf.vertexCount; v++)
+					{
+						auto* p = reinterpret_cast<float*>(verts + 32ull * v);
+						for (auto a = 0; a < 3; a++) p[a] = n.origin[a] + s * (p[a] - ref_origin[a]);
+					}
+					auto* idx = mem->allocate<unsigned short>(rf.indexCount);
+					std::memcpy(idx, ref_indices.data(), 2ull * rf.indexCount);
+					f.vertices = verts; f.vertexCount = rf.vertexCount;
+					f.indices = idx; f.indexCount = rf.indexCount;
+					f.indexBuffer = nullptr; f.vertexBuffer = nullptr;
+					moved_vertices += rf.vertexCount;
+					if (w->lightViewFrustums)
+					{
+						auto& v = w->lightViewFrustums[k];
+						v = {};
+						if (n.type == GFX_LIGHT_TYPE_SPOT)
+						{
+							// the box around the light's sphere, in the stock layout (cp_zmb light 996): inside is
+							// n.p + d >= 0; vertex i = (x low: 1) + (y high: 2) + (z low: 4)
+							float lo[3], hi[3];
+							for (auto a = 0; a < 3; a++) { lo[a] = n.origin[a] - n.radius; hi[a] = n.origin[a] + n.radius; }
+							auto* pl = mem->allocate<vec4_t>(6);
+							const float planes[6][4] = {{0, 0, -1, hi[2]}, {0, 0, 1, -lo[2]}, {0, 1, 0, -lo[1]}, {0, -1, 0, hi[1]},
+								{-1, 0, 0, hi[0]}, {1, 0, 0, -lo[0]}};
+							std::memcpy(pl, planes, sizeof(planes));
+							auto* vv = mem->allocate<vec3_t>(8);
+							for (auto i = 0; i < 8; i++)
+							{
+								vv[i][0] = (i & 1) ? lo[0] : hi[0];
+								vv[i][1] = (i & 2) ? hi[1] : lo[1];
+								vv[i][2] = (i & 4) ? lo[2] : hi[2];
+							}
+							static const unsigned short box[36] = {1, 0, 2, 1, 2, 3, 7, 6, 4, 7, 4, 5, 5, 4, 0, 5, 0, 1, 3, 2, 6, 3, 6, 7,
+								6, 2, 0, 6, 0, 4, 5, 1, 3, 5, 3, 7};
+							auto* bi = mem->allocate<unsigned short>(36);
+							std::memcpy(bi, box, sizeof(box));
+							v.planeCount = 6; v.planes = pl; v.vertexCount = 8; v.vertices = vv; v.indexCount = 36; v.indices = bi;
+							moved_vertices += 8;
+						}
+					}
+				}
+				else if (w->frustumLights)
 				{
 					auto& f = w->frustumLights[k];
 					if (f.vertices && f.vertexCount)
@@ -1663,7 +1742,7 @@ namespace zonetool::iw7::iwzmap
 						moved_vertices += f.vertexCount;
 					}
 				}
-				if (w->lightViewFrustums)
+				if (!own_shapes && w->lightViewFrustums)
 				{
 					auto& f = w->lightViewFrustums[k];
 					if (f.planes && f.planeCount)
