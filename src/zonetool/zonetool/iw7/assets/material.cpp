@@ -38,6 +38,9 @@
 
 namespace zonetool::iw7
 {
+	// the parsed-asset cache of the build server (zone.cpp): the asset being parsed is not to be cached
+	void asset_cache_mark_unsafe();
+
 	namespace
 	{
 		std::string clean_name(const std::string& name)
@@ -368,6 +371,23 @@ namespace zonetool::iw7
 			}
 
 			auto material = this->asset_;
+			// The default asset is the game's own material, in the memory of a loaded zone. prepare() writes the state indices of
+			// the zone being built into its state table, so a second build in the same process read those back as indices of the
+			// game's tables and registered other states than the first (about 170 bytes more per build, measured). The table is
+			// built from a private copy of the material and its state table; a build server also never caches this asset
+			// (its other pointers are into the zone).
+			{
+				auto* own = mem->allocate<Material>();
+				*own = *material;
+				if (material->stateBitsCount && material->stateBitsTable)
+				{
+					own->stateBitsTable = mem->allocate<GfxStateBits>(material->stateBitsCount);
+					std::memcpy(own->stateBitsTable, material->stateBitsTable, sizeof(GfxStateBits) * material->stateBitsCount);
+				}
+				asset_cache_mark_unsafe();
+				this->asset_ = own;
+				material = own;
+			}
 			for (auto i = 0; i < material->stateBitsCount; i++)
 			{
 				const auto var_x_gfx_globals = get_x_gfx_globals_for_zone<XGfxGlobals>(material->stateBitsTable[i].zone);

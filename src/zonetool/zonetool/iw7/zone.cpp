@@ -315,6 +315,11 @@ namespace zonetool::iw7
 		};
 	}
 
+	void asset_cache_mark_unsafe()
+	{
+		if (asset_cache::t_frame) asset_cache::t_frame->unsafe = true;
+	}
+
 	namespace compression::iwc
 	{
 		size_t align_value(size_t value, unsigned int alignment)
