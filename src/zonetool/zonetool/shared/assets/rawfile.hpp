@@ -75,7 +75,9 @@ namespace zonetool
 
 				this->asset_ = mem->allocate<S>();
 				this->asset_->name = mem->duplicate_string(name);
-				this->asset_->buffer = mem->duplicate_string(buffer.data());
+				auto* own_buffer = mem->allocate<char>(buffer.size());
+				std::memcpy(own_buffer, buffer.data(), buffer.size());
+				this->asset_->buffer = own_buffer;
 				this->asset_->len = static_cast<int>(str.size());
 				this->asset_->compressedLen = static_cast<int>(buffer.size());
 			}
