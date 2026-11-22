@@ -170,6 +170,7 @@ namespace zonetool
 		this->length_ = 0;
 
 		this->sub_zone_buffers_.clear();
+		this->sub_zone_pages_.clear();
 		this->init_script_strings();
 		this->depth_stencil_state_bits_.clear();
 		this->blend_state_bits_.clear();

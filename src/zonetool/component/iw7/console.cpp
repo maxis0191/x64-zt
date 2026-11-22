@@ -4,6 +4,7 @@
 #include "game/iw7/game.hpp"
 
 #include <utils/thread.hpp>
+#include <utils/flags.hpp>
 
 namespace iw7
 {
@@ -38,6 +39,7 @@ namespace iw7
 		public:
 			void post_start() override
 			{
+				if (utils::flags::has_flag("serve")) return;
 				const auto handle = CreateThread(0, 0, console, 0, 0, 0);
 				utils::thread::set_name(handle, "Console");
 			}

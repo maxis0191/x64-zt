@@ -16,6 +16,8 @@
 
 namespace zonetool::iw7
 {
+	namespace asset_cache { bool active(); void set_enabled(bool on); void flush(); void begin_build(); std::string stats(); }
+
 	struct dump_params
 	{
 		game::game_mode target;
@@ -1159,12 +1161,12 @@ namespace zonetool::iw7
 
 	void clear_asset_fields()
 	{
-		material::fixed_nml_images_map.clear();
+		if (!asset_cache::active()) material::fixed_nml_images_map.clear();
 		techset::vertexdecl_pointers.clear();
 		//xanim_parts::secondary_anims.clear();
 	}
 
-	void build_zone(const std::string& fastfile)
+	bool build_zone(const std::string& fastfile)
 	{
 		const auto previous_enemy_build = enemy_pack_build_active;
 		enemy_pack_build_active = fastfile.starts_with("paris_enemy_");
@@ -1178,11 +1180,12 @@ namespace zonetool::iw7
 		if (zone == nullptr)
 		{
 			ZONETOOL_ERROR("An error occured while building fastfile \"%s\": Are you out of memory?", fastfile.data());
-			return;
+			return false;
 		}
 
 		ignore_assets.clear();
 		clear_asset_fields();
+		if (asset_cache::active()) asset_cache::begin_build();
 
 		zonetool::taskbar::set_indeterminate();
 
@@ -1195,7 +1198,7 @@ namespace zonetool::iw7
 		catch (std::exception& ex)
 		{
 			ZONETOOL_ERROR("%s", ex.what());
-			return;
+			return false;
 		}
 
 		// allocate zone buffer
@@ -1219,6 +1222,8 @@ namespace zonetool::iw7
 
 		ignore_assets.clear();
 		clear_asset_fields();
+		if (asset_cache::active()) ZONETOOL_INFO("[ TIMING ] asset cache: %s", asset_cache::stats().c_str());
+		return true;
 	}
 
 	void iterate_zones()
@@ -2582,8 +2587,130 @@ namespace zonetool::iw7
 		ZONETOOL_INFO("Soundbank catalog: %s; alias lists=%u; metadata only; output=%s", bank_name.c_str(), bank->aliasCount, output.string().c_str());
 	}
 
+	// ---- the build server (-serve): ZoneTool stays up and takes one JSON command per line on stdin, one answer line
+	// "@@ZT@@ {json}" per command on stdout. The commands run on the thread that runs the one-shot commands (handle_params).
+	// State a second command must not inherit is reset here and in build_zone (asset lists, ignore sets, search paths).
+	json serve_command(const json& req)
+	{
+		const auto cmd = req.value("cmd", std::string{});
+		json answer = { {"ok", false}, {"cmd", cmd} };
+		const auto start = std::chrono::steady_clock::now();
+
+		// environment switches of this command (the IWZ_* variables of the map compiler), restored afterwards
+		std::vector<std::pair<std::string, std::optional<std::string>>> saved;
+		if (req.contains("env") && req["env"].is_object())
+		{
+			for (const auto& [name, value] : req["env"].items())
+			{
+				const auto* old = std::getenv(name.c_str());
+				saved.emplace_back(name, old ? std::optional<std::string>(old) : std::nullopt);
+				_putenv_s(name.c_str(), value.is_string() ? value.get<std::string>().c_str() : "");
+			}
+		}
+		const auto restore = gsl::finally([&]
+		{
+			for (const auto& [name, old] : saved) _putenv_s(name.c_str(), old ? old->c_str() : "");
+		});
+
+		try
+		{
+			if (req.contains("cache")) asset_cache::set_enabled(req["cache"].get<bool>());
+			if (cmd == "ping")
+			{
+				answer["ok"] = true;
+			}
+			else if (cmd == "compile")
+			{
+				const auto& args = req.at("args");
+				answer["ok"] = iwzmap::compile(args.at(0), args.at(1), args.at(2), args.at(3));
+			}
+			else if (cmd == "buildzone")
+			{
+				answer["ok"] = build_zone(req.at("map").get<std::string>());
+			}
+			else if (cmd == "dumpzonetypes")
+			{
+				const auto zone = req.at("zone").get<std::string>();
+				asset_type_filter.clear();
+				for (const auto& type_str : utils::string::split(req.at("types").get<std::string>(), ','))
+				{
+					const auto type = type_to_int(type_str);
+					if (type != -1) asset_type_filter.insert(static_cast<XAssetType>(type));
+					else ZONETOOL_ERROR("Asset type \"%s\" does not exist", type_str.data());
+				}
+				const auto companion = "techsets_"s + zone;
+				if (!zone.starts_with("techsets_") && zone_exists(companion) && !is_zone_loaded(companion))
+				{
+					load_zone(companion, DB_LOAD_ASYNC, false);
+					wait_for_database();
+				}
+				dump_zone(zone, game::iw7);
+				// what a dump loaded is unloaded, so that a later build sees what a fresh process sees
+				unload_zones();
+				asset_cache::flush(); // cached references point into the zones just unloaded
+				asset_type_filter.clear();
+				answer["ok"] = true;
+			}
+			else if (cmd == "flush")
+			{
+				asset_cache::flush();
+				answer["ok"] = true;
+			}
+			else if (cmd == "stats")
+			{
+				answer["ok"] = true;
+				answer["stats"] = asset_cache::stats();
+			}
+			else if (cmd == "quit")
+			{
+				answer["ok"] = true;
+				answer["quit"] = true;
+			}
+			else
+			{
+				answer["error"] = "unknown command " + cmd;
+			}
+		}
+		catch (const std::exception& ex)
+		{
+			answer["ok"] = false;
+			answer["error"] = ex.what();
+		}
+		answer["seconds"] = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		return answer;
+	}
+
+	void serve()
+	{
+		setvbuf(stdout, nullptr, _IONBF, 0);
+		asset_cache::set_enabled(std::getenv("ZT_NO_CACHE") == nullptr);
+		ZONETOOL_INFO("build server ready (asset cache %s)", asset_cache::active() ? "on" : "off");
+		std::string line;
+		while (std::getline(std::cin, line))
+		{
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			if (line.empty()) continue;
+			json answer;
+			try
+			{
+				answer = serve_command(json::parse(line));
+			}
+			catch (const std::exception& ex)
+			{
+				answer = { {"ok", false}, {"error", std::string("bad request: ") + ex.what()} };
+			}
+			const auto text = answer.dump();
+			printf("@@ZT@@ %s\n", text.c_str());
+			fflush(stdout);
+			if (answer.value("quit", false)) break;
+		}
+		fflush(nullptr);
+		std::quick_exit(EXIT_SUCCESS);
+	}
+
 	void handle_params()
 	{
+		if (utils::flags::has_flag("serve")) serve();
 		// Execute command line commands
 		auto args = get_command_line_arguments();
 		if (args.size() > 1)

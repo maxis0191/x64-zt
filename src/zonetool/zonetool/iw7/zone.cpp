@@ -12,6 +12,12 @@
 #include <lz4hc.h>
 #include <chrono>
 #include <map>
+#include <atomic>
+#include <thread>
+#include <functional>
+#include <unordered_set>
+#include <utils/hook.hpp>
+#include <cwctype>
 
 #define FF_MAGIC_SIGNED "IWff0100"
 #define FF_MAGIC_UNSIGNED "IWffu100"
@@ -52,6 +58,249 @@ namespace zonetool::iw7
 		{
 			std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
 			double lap() { const auto n = std::chrono::steady_clock::now(); const auto d = std::chrono::duration<double>(n - t).count(); t = n; return d; }
+		};
+	}
+
+
+	// ------------------------------------------------------------------------------------------------------------
+	// The parsed-asset cache of the build server (-serve). A zone build parses every asset of its csv from files
+	// (about 18 s for a map's 135,000 stock assets) and the result is the same from build to build. In the server the
+	// parsed asset objects live on between builds, keyed by (type, name):
+	//  * an entry holds the asset, the ordered (type, name) list of the dependencies its parse added to the zone and
+	//    the files its parse opened or probed (hooked at CreateFileW / GetFileAttributes*W / FindFirstFileExW), each
+	//    with the size and time seen;
+	//  * a hit replays the dependency additions through add_asset_of_type (so the zone's asset order, which pointers
+	//    encode, is the one a fresh parse gives) and pushes the cached asset; no file is read;
+	//  * an entry is valid when none of its files changed (all distinct files are stat'ed by 16 threads at the start of
+	//    a build) and every dependency's entry is valid: a changed source file re-parses that asset and, through the
+	//    dependency rule, the assets that were parsed with it;
+	//  * the objects are allocated in an arena of their own that outlives the per-build zone; when it is 85 % used the
+	//    cache is flushed.
+	// Not cached: assets whose parse adds a localize entry by pointer, builds of the paris_enemy_ packs.
+	namespace asset_cache
+	{
+		struct stamp
+		{
+			bool exists = false;
+			unsigned long long size = 0;
+			unsigned long long time = 0;
+			bool operator==(const stamp& o) const { return exists == o.exists && size == o.size && time == o.time; }
+		};
+
+		struct entry
+		{
+			std::shared_ptr<asset_interface> asset;
+			std::vector<std::pair<std::int32_t, std::string>> deps;
+			std::vector<std::pair<int, stamp>> files; // (path id, stamp seen)
+		};
+
+		struct frame
+		{
+			std::vector<std::pair<std::int32_t, std::string>> deps;
+			std::unordered_set<std::wstring> files;
+			bool unsafe = false;
+			frame* parent = nullptr;
+		};
+
+		bool g_enabled = false;
+		thread_local frame* t_frame = nullptr;
+		thread_local bool t_quiet = false;
+		std::unordered_map<std::string, entry> g_table;
+		std::vector<std::wstring> g_paths;
+		std::unordered_map<std::wstring, int> g_path_id;
+		std::vector<stamp> g_current;                      // current stamp of every path, computed at the start of a build
+		std::unordered_map<std::string, signed char> g_ok; // per build: 1 valid, 0 invalid, -1 being checked
+		std::shared_ptr<zone_memory> g_arena;
+		std::size_t g_hits = 0, g_misses = 0, g_invalid = 0, g_uncacheable = 0;
+		bool g_hooked = false;
+		utils::hook::detour h_create, h_attr, h_attr_ex, h_find;
+
+		void record(const wchar_t* path)
+		{
+			if (t_frame && !t_quiet && path)
+			{
+				std::wstring p(path);
+				for (auto& c : p) { c = static_cast<wchar_t>(towlower(c)); if (c == L'/') c = L'\\'; }
+				t_frame->files.insert(std::move(p));
+			}
+		}
+
+		HANDLE WINAPI create_file_stub(LPCWSTR n, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sa, DWORD d, DWORD f, HANDLE t)
+		{
+			record(n);
+			return h_create.invoke<HANDLE>(n, a, s, sa, d, f, t);
+		}
+
+		DWORD WINAPI get_attr_stub(LPCWSTR n)
+		{
+			record(n);
+			return h_attr.invoke<DWORD>(n);
+		}
+
+		BOOL WINAPI get_attr_ex_stub(LPCWSTR n, GET_FILEEX_INFO_LEVELS l, LPVOID d)
+		{
+			record(n);
+			return h_attr_ex.invoke<BOOL>(n, l, d);
+		}
+
+		HANDLE WINAPI find_first_stub(LPCWSTR n, FINDEX_INFO_LEVELS l, LPVOID d, FINDEX_SEARCH_OPS o, LPVOID f, DWORD fl)
+		{
+			record(n);
+			return h_find.invoke<HANDLE>(n, l, d, o, f, fl);
+		}
+
+		void install_hooks()
+		{
+			if (g_hooked) return;
+			g_hooked = true;
+			const auto kb = GetModuleHandleA("kernelbase.dll");
+			const auto k32 = GetModuleHandleA("kernel32.dll");
+			const auto get = [&](const char* name) -> void*
+			{
+				auto p = kb ? GetProcAddress(kb, name) : nullptr;
+				if (!p && k32) p = GetProcAddress(k32, name);
+				return reinterpret_cast<void*>(p);
+			};
+			h_create.create(get("CreateFileW"), create_file_stub);
+			h_attr.create(get("GetFileAttributesW"), get_attr_stub);
+			h_attr_ex.create(get("GetFileAttributesExW"), get_attr_ex_stub);
+			h_find.create(get("FindFirstFileExW"), find_first_stub);
+		}
+
+		stamp stat_of(const std::wstring& path)
+		{
+			t_quiet = true;
+			stamp s;
+			WIN32_FILE_ATTRIBUTE_DATA d{};
+			if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d))
+			{
+				s.exists = true;
+				s.size = (static_cast<unsigned long long>(d.nFileSizeHigh) << 32) | d.nFileSizeLow;
+				s.time = (static_cast<unsigned long long>(d.ftLastWriteTime.dwHighDateTime) << 32) | d.ftLastWriteTime.dwLowDateTime;
+			}
+			t_quiet = false;
+			return s;
+		}
+
+		bool active() { return g_enabled; }
+
+		void set_enabled(bool on)
+		{
+			g_enabled = on;
+			if (on) install_hooks();
+		}
+
+		void flush()
+		{
+			g_table.clear();
+			g_paths.clear();
+			g_path_id.clear();
+			g_current.clear();
+			g_ok.clear();
+			g_arena.reset();
+			g_hits = g_misses = g_invalid = g_uncacheable = 0;
+			material::fixed_nml_images_map.clear();
+		}
+
+		// zone_memory keeps its position private and the header is included by every asset file: read it through the
+		// explicit-instantiation access idiom instead of changing the header (which would rebuild the whole project)
+		template <class Tag, typename Tag::type M>
+		struct member_ref { friend typename Tag::type member_of(Tag) { return M; } };
+		struct mem_pos_tag { using type = std::size_t zone_memory::*; friend type member_of(mem_pos_tag); };
+		template struct member_ref<mem_pos_tag, &zone_memory::mem_pos_>;
+		std::size_t arena_used() { return g_arena ? (g_arena.get()->*member_of(mem_pos_tag{})) : 0; }
+
+		std::string stats()
+		{
+			return utils::string::va("%zu entries, %zu files, arena %.0f MB, hits %zu, misses %zu (of which stale %zu), not cacheable %zu", g_table.size(),
+				g_paths.size(), arena_used() / 1048576.0, g_hits, g_misses, g_invalid, g_uncacheable);
+		}
+
+		zone_memory* arena()
+		{
+			if (!g_arena) g_arena = std::make_shared<zone_memory>(MAX_ZONE_SIZE);
+			return g_arena.get();
+		}
+
+		// the start of a build: the current stamp of every file any entry has seen
+		void begin_build()
+		{
+			g_hits = g_misses = g_invalid = g_uncacheable = 0;
+			g_ok.clear();
+			if (g_arena && arena_used() > MAX_ZONE_SIZE / 100 * 85)
+			{
+				ZONETOOL_INFO("asset cache: arena %.0f of %.0f MB used, flushing the cache", arena_used() / 1048576.0, MAX_ZONE_SIZE / 1048576.0);
+				flush();
+			}
+			const auto n = g_paths.size();
+			g_current.assign(n, stamp{});
+			const auto threads = std::min<std::size_t>(16, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+			std::atomic<std::size_t> next{0};
+			std::vector<std::thread> pool;
+			for (std::size_t t = 0; t < threads; t++)
+			{
+				pool.emplace_back([&]
+				{
+					for (std::size_t i; (i = next.fetch_add(256)) < n;)
+					{
+						for (std::size_t j = i; j < std::min(n, i + 256); j++) g_current[j] = stat_of(g_paths[j]);
+					}
+				});
+			}
+			for (auto& t : pool) t.join();
+		}
+
+		int path_id(const std::wstring& p)
+		{
+			const auto it = g_path_id.find(p);
+			if (it != g_path_id.end()) return it->second;
+			const auto id = static_cast<int>(g_paths.size());
+			g_paths.push_back(p);
+			g_path_id.emplace(p, id);
+			return id;
+		}
+
+		bool files_unchanged(const entry& e)
+		{
+			for (const auto& [id, seen] : e.files)
+			{
+				if (!(g_current[id] == seen)) return false;
+			}
+			return true;
+		}
+
+		// an entry is usable when its own files are unchanged and every dependency entry is usable
+		bool usable(const std::string& key, const std::function<std::string(const std::pair<std::int32_t, std::string>&)>& dep_key)
+		{
+			const auto ok = g_ok.find(key);
+			if (ok != g_ok.end()) return ok->second != 0;
+			const auto it = g_table.find(key);
+			if (it == g_table.end()) return false;
+			g_ok[key] = -1;
+			bool good = files_unchanged(it->second);
+			for (const auto& d : it->second.deps)
+			{
+				if (!good) break;
+				const auto dk = dep_key(d);
+				if (dk.empty() || !g_table.contains(dk)) continue; // nothing was cached for it (a type that adds nothing)
+				good = usable(dk, dep_key);
+			}
+			g_ok[key] = good ? 1 : 0;
+			return good;
+		}
+
+		struct guard
+		{
+			frame f;
+			bool on;
+			explicit guard(bool enable) : on(enable)
+			{
+				if (on) { f.parent = t_frame; t_frame = &f; }
+			}
+			~guard()
+			{
+				if (on) t_frame = f.parent;
+			}
 		};
 	}
 
@@ -339,6 +588,59 @@ namespace zonetool::iw7
 				data_ptr += block_size;
 			};
 
+			if (type == XBLOCK_COMPRESSION_LZ4 && bytes_to_compress > 0)
+			{
+				// the same bytes as the loop below: every 64 KiB block is compressed on its own, so the blocks are compressed
+				// by several threads and written in order (a zone of a map is 1 GB or more of input)
+				const auto total = static_cast<std::size_t>(bytes_to_compress);
+				const auto count = (total + MAX_BLOCK_SIZE - 1) / MAX_BLOCK_SIZE;
+				std::vector<std::vector<char>> packed(count);
+				std::vector<unsigned int> packed_size(count);
+				std::atomic<std::size_t> next{0};
+				const auto workers = std::min<std::size_t>(16, std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+				std::vector<std::thread> pool;
+				for (std::size_t w = 0; w < workers; w++)
+				{
+					pool.emplace_back([&]
+					{
+						for (std::size_t i; (i = next.fetch_add(1)) < count;)
+						{
+							const auto block_size = static_cast<unsigned int>(std::min<std::size_t>(total - i * MAX_BLOCK_SIZE, MAX_BLOCK_SIZE));
+							const auto bound = LZ4_compressBound(block_size);
+							std::vector<char> buffer(bound);
+							const auto compressed_size = LZ4_compress_default(data_ptr + i * MAX_BLOCK_SIZE, buffer.data(), block_size, bound);
+							packed_size[i] = static_cast<unsigned int>(compressed_size);
+							buffer.resize(align_value(compressed_size, 4));
+							packed[i] = std::move(buffer);
+						}
+					});
+				}
+				for (auto& t : pool) t.join();
+
+				std::size_t out_size = out_buffer.size() + sizeof(XBlockCompressionDataHeader);
+				for (const auto& b : packed) out_size += sizeof(XBlockCompressionBlockHeader) + b.size();
+				out_buffer.reserve(out_size);
+				const auto append = [&](const void* p, const std::size_t n)
+				{
+					const auto* bytes = static_cast<const std::uint8_t*>(p);
+					out_buffer.insert(out_buffer.end(), bytes, bytes + n);
+				};
+				XBlockCompressionDataHeader header{};
+				header.uncompressedSize = total;
+				header.blockSizeAndType.blockSize = MAX_BLOCK_SIZE;
+				header.blockSizeAndType.compressionType = XBLOCK_COMPRESSION_LZ4;
+				append(&header, sizeof(header));
+				for (std::size_t i = 0; i < count; i++)
+				{
+					XBlockCompressionBlockHeader block_header{};
+					block_header.compressedSize = packed_size[i];
+					block_header.uncompressedSize = static_cast<std::uint64_t>(std::min<std::size_t>(total - i * MAX_BLOCK_SIZE, MAX_BLOCK_SIZE));
+					append(&block_header, sizeof(block_header));
+					append(packed[i].data(), packed[i].size());
+				}
+				return out_buffer;
+			}
+
 			while (bytes_to_compress > 0)
 			{
 				if (type == XBLOCK_COMPRESSION_LZ4)
@@ -548,6 +850,7 @@ namespace zonetool::iw7
 		}
 
 		const std::string& name = get_asset_name(XAssetType(type), pointer);
+		if (asset_cache::t_frame) asset_cache::t_frame->unsafe = true;
 
 		// don't add asset if it already exists
 		if (find_asset_index(type, name) < m_assets.size())
@@ -576,6 +879,7 @@ namespace zonetool::iw7
 		}
 	}
 
+
 	void zone_interface::add_asset_of_type(std::int32_t type, const std::string& _name)
 	{
 		std::string name = _name;
@@ -583,6 +887,11 @@ namespace zonetool::iw7
 		if (name.empty())
 		{
 			return;
+		}
+
+		if (asset_cache::t_frame && !asset_cache::t_quiet)
+		{
+			asset_cache::t_frame->deps.emplace_back(type, _name);
 		}
 
 		// add ignore assets as referenced
@@ -600,14 +909,64 @@ namespace zonetool::iw7
 			return;
 		}
 
+		// the cached add of one asset (see asset_cache): a hit replays the dependency additions and pushes the cached asset
+		auto add_cached = [&](auto* tag)
+		{
+			using T = std::remove_pointer_t<decltype(tag)>;
+			const auto cached = asset_cache::active() && !name_.starts_with("paris_enemy_");
+			const auto key = asset_key(type, name);
+			if (cached)
+			{
+				const auto dep_key = [this](const std::pair<std::int32_t, std::string>& d)
+				{
+					auto n = d.second;
+					if (n.empty()) return std::string{};
+					if (ignore_assets.find(std::make_pair(static_cast<std::uint32_t>(d.first), n)) != ignore_assets.end() && !n.starts_with(",")) n = ","s + n;
+					return asset_key(d.first, n);
+				};
+				if (asset_cache::usable(key, dep_key))
+				{
+					const auto entry = asset_cache::g_table.at(key);
+					for (const auto& d : entry.deps) add_asset_of_type(d.first, d.second);
+					asset_cache::g_hits++;
+					push_asset(entry.asset);
+					return;
+				}
+				if (asset_cache::g_table.contains(key)) asset_cache::g_invalid++;
+				asset_cache::g_misses++;
+			}
+
+			auto asset = std::make_shared<T>();
+			{
+				asset_cache::guard scope(cached);
+				asset->init(name, cached ? asset_cache::arena() : this->m_zonemem.get());
+				dump_enemy_pack_asset(static_cast<XAssetType>(type), asset->pointer());
+				asset->load_depending(this);
+				if (cached)
+				{
+					if (scope.f.unsafe)
+					{
+						asset_cache::g_uncacheable++;
+						asset_cache::g_table.erase(key);
+					}
+					else
+					{
+						asset_cache::entry e;
+						e.asset = asset;
+						e.deps = std::move(scope.f.deps);
+						for (const auto& p : scope.f.files) e.files.emplace_back(asset_cache::path_id(p), asset_cache::stat_of(p));
+						asset_cache::g_table[key] = std::move(e);
+						asset_cache::g_ok[key] = 1;
+					}
+				}
+			}
+			push_asset(asset);
+		};
+
 #define ADD_ASSET(__type__, ___) \
 		if (type == __type__) \
 		{ \
-			auto asset = std::make_shared < ___ >(); \
-			asset->init(name, this->m_zonemem.get()); \
-			dump_enemy_pack_asset(static_cast<XAssetType>(type), asset->pointer()); \
-			asset->load_depending(this); \
-			push_asset(asset); \
+			add_cached(static_cast< ___ *>(nullptr)); \
 		}
 
 		try

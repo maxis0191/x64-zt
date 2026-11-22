@@ -61,12 +61,25 @@ namespace zonetool
 			return reinterpret_cast<T*>(this->buffer_.data() + this->pos_);
 		}
 
+		// Where an address of the source data was written: the first of the buffers written so far that contains it. A scan of
+		// every buffer (millions in a map zone) made the write of a zone quadratic (13 s of the 38 s zone step of a 360
+		// triangle map); the buffers are indexed by the 4 KiB pages of source memory they cover instead, and the first of the
+		// buffers on the page that contains the address is the same buffer the scan found.
+		static constexpr unsigned sub_buffer_page_shift = 12;
+
 		template <typename T>
 		T* find_sub_buffer(const T* data)
 		{
 			const auto ptr = reinterpret_cast<std::size_t>(data);
-			for (const auto& buffer : this->sub_zone_buffers_)
+			const auto page = this->sub_zone_pages_.find(ptr >> sub_buffer_page_shift);
+			if (page == this->sub_zone_pages_.end())
 			{
+				return nullptr;
+			}
+
+			for (const auto index : page->second)
+			{
+				const auto& buffer = this->sub_zone_buffers_[index];
 				if (ptr >= buffer.start && ptr < buffer.end)
 				{
 					const auto offset = ptr - buffer.start;
@@ -85,7 +98,15 @@ namespace zonetool
 			buffer.end = buffer.start + size * count;
 			buffer.ptr = this->zone_streams_[this->stream_];
 			buffer.stream = this->stream_;
+			const auto index = static_cast<std::uint32_t>(this->sub_zone_buffers_.size());
 			this->sub_zone_buffers_.emplace_back(buffer);
+			if (buffer.end > buffer.start)
+			{
+				for (auto page = buffer.start >> sub_buffer_page_shift; page <= (buffer.end - 1) >> sub_buffer_page_shift; page++)
+				{
+					this->sub_zone_pages_[page].push_back(index);
+				}
+			}
 		}
 
 		template <typename T>
@@ -247,6 +268,7 @@ namespace zonetool
 		void init_script_strings();
 
 		std::vector<sub_zone_buffer> sub_zone_buffers_;
+		std::unordered_map<std::size_t, std::vector<std::uint32_t>> sub_zone_pages_;
 
 	};
 }
