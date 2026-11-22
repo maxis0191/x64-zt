@@ -2751,6 +2751,21 @@ namespace zonetool::iw7::iwzmap
 						ZONETOOL_INFO("template scriptable #%u tn \"%s\" debug \"%s\" / \"%s\" def %s at %.0f %.0f %.0f", i, name.data(),
 							inst.debugName ? inst.debugName : "", dn ? dn : "", inst.contextHeader.context.def->name,
 							inst.contextHeader.context.origin[0], inst.contextHeader.context.origin[1], inst.contextHeader.context.origin[2]);
+						// every stored field of the instance (RC4: the relocated Pack-a-Punch scriptable draws nothing while the
+						// relocated perk scriptables do; the difference is in these)
+						auto ctx = [](const char* what, const ScriptableInstanceContext& c)
+						{
+							ZONETOOL_INFO("  %s: partStateIndex %u unk04 %d model %s neverMoves %d dynSim %d events %u reserved %u", what,
+								c.partStateIndex, c.unk04, c.modelData.model ? c.modelData.model->name : "-", c.modelData.neverMoves,
+								c.modelData.dynamicSimulation, c.eventStreamBufferSize, c.reservedStateListHeader);
+						};
+						ctx("server", inst.contextHeader.context);
+						ctx("client0", inst.contextHeaderLocalClient[0].context);
+						ctx("client1", inst.contextHeaderLocalClient[1].context);
+						const auto* h = inst.contextHeader.unk02;
+						const auto* l = inst.contextHeaderLocalClient[0].unk02;
+						ZONETOOL_INFO("  flags %d hdr %d %d %d %d client0 %d %d %d %d %d %d %d %d %d %d", inst.flags, h[0], h[1], h[2], h[3],
+							l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9]);
 					}
 					const auto nth = name.empty() ? 0u : seen_names[name]++;
 					move* mv = nullptr;
