@@ -537,28 +537,28 @@ namespace zonetool::iw7
 		{
 			buf->align(0);
 			buf->write(data->pathExposure, data->exposureBytes);
-			buf->clear_pointer(dest->pathExposure);
+			buf->clear_pointer(&dest->pathExposure);
 		}
 
 		if (data->pathNoPeekVis)
 		{
 			buf->align(0);
 			buf->write(data->pathNoPeekVis, data->noPeekVisBytes);
-			buf->clear_pointer(dest->pathNoPeekVis);
+			buf->clear_pointer(&dest->pathNoPeekVis);
 		}
 
 		if (data->pathZones)
 		{
 			buf->align(0);
 			buf->write(data->pathZones, data->zonesBytes);
-			buf->clear_pointer(dest->pathZones);
+			buf->clear_pointer(&dest->pathZones);
 		}
 
 		if (data->pathDynStates)
 		{
 			buf->align(0);
 			buf->write(data->pathDynStates, data->dynStatesBytes);
-			buf->clear_pointer(dest->pathDynStates);
+			buf->clear_pointer(&dest->pathDynStates);
 		}
 
 		buf->pop_stream();

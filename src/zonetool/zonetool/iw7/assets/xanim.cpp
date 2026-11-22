@@ -313,7 +313,7 @@ namespace zonetool::iw7
 					{
 						buf->align(3);
 						buf->write_stream(partdata->quat2->u.frames.frames, sizeof(short[2]) * partdata->quat2->size + 4);
-						buf->clear_pointer(partdestu->u.frames.frames);
+						buf->clear_pointer(&partdestu->u.frames.frames);
 					}
 				}
 				else
