@@ -9,6 +9,8 @@ msbuild tests/sound_bank_subset_tests.vcxproj /m:1 /nr:false /p:Configuration=Re
 ./build/tests/sound_bank_subset_tests.exe
 msbuild tests/iwzmap_smodel_rules_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
 ./build/tests/iwzmap_smodel_rules_tests.exe
+msbuild tests/iwzmap_voxel_lists_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
+./build/tests/iwzmap_voxel_lists_tests.exe
 ```
 
 The filesystem target compiles the production `filesystem.cpp` with a minimal
@@ -31,3 +33,7 @@ not show that the game draws such a model; that is a map run (README, "Static mo
 
 Each executable creates a unique temporary test directory and removes only its
 own known files on success. On failure, the directory remains for diagnosis.
+
+The voxel light list target (`iwzmap_voxel_lists.hpp`, header only) checks the compiler's static light voxel lists: which distinct light sets need a list of
+their own when a leaf may name a few lights its box is outside of (`absorb`), the smallest slack that keeps the array under the u16 address limit (`choose`), and a
+fixture whose entry counts equal `studio/voxellights.py` of the Studio repository.

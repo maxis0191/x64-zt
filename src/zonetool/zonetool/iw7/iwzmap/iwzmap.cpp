@@ -3,6 +3,7 @@
 #include "iwzmap.hpp"
 #include "iwzmap_lightmap.hpp"
 #include "iwzmap_smodel_rules.hpp"
+#include "iwzmap_voxel_lists.hpp"
 
 #include <array>
 #include <bit>
@@ -1756,36 +1757,29 @@ namespace zonetool::iw7::iwzmap
 			h->nodeCoordBitShift[0] = 9; h->nodeCoordBitShift[1] = 7; h->nodeCoordBitShift[2] = 5; h->nodeCoordBitShift[3] = 0;
 			h->boundMin[3] = h->boundMax[3] = 0.0f;
 
-			// light lists
+			// light lists: every leaf gets the set of lights whose sphere touches its box (voxel_lists.hpp); the distinct sets are
+			// kept in the order they are first met, then `voxel_lists::choose` decides which of them need a list of their own
 			std::vector<unsigned short> arr = {t.lightListArraySize > 1 ? t.lightListArray[0] : static_cast<unsigned short>(16384),
 				t.lightListArraySize > 1 ? t.lightListArray[1] : static_cast<unsigned short>(1), 0};
-			std::map<std::vector<unsigned short>, unsigned short> addresses;
-			addresses[{}] = 2;
+			std::map<voxel_lists::light_set, std::size_t> set_ids;
+			std::vector<voxel_lists::light_set> sets;
+			constexpr auto no_set = static_cast<std::size_t>(-1);
+			std::vector<std::size_t> leaf_set(1, no_set); // per leaf (leaf 0 is reserved)
 			auto touching = [&](const float* o, float size)
 			{
-				std::vector<unsigned short> spots, omnis;
-				for (const auto& l : lights)
-				{
-					if (!box_touches_sphere(o, size, l.origin, l.radius)) continue;
-					(cw->primaryLights[l.slot].type == GFX_LIGHT_TYPE_SPOT ? spots : omnis).push_back(static_cast<unsigned short>(l.slot));
-				}
-				std::sort(spots.begin(), spots.end());
-				std::sort(omnis.begin(), omnis.end());
-				std::vector<unsigned short> key;
-				if (spots.empty() && omnis.empty()) return key;
-				key.push_back(static_cast<unsigned short>((spots.size() << 7) | omnis.size()));
-				key.insert(key.end(), spots.begin(), spots.end());
-				key.insert(key.end(), omnis.begin(), omnis.end());
-				return key;
+				voxel_lists::light_set s;
+				for (std::size_t i = 0; i < lights.size(); i++)
+					if (box_touches_sphere(o, size, lights[i].origin, lights[i].radius)) s.push_back(static_cast<unsigned short>(i));
+				return s;
 			};
-			auto address = [&](const std::vector<unsigned short>& key) -> unsigned short
+			auto set_id = [&](voxel_lists::light_set&& s) -> std::size_t
 			{
-				if (const auto it = addresses.find(key); it != addresses.end()) return it->second;
-				if (arr.size() + key.size() > 0xFFFF) throw std::runtime_error("voxel light lists exceed 65535 entries");
-				const auto a = static_cast<unsigned short>(arr.size());
-				arr.insert(arr.end(), key.begin(), key.end());
-				addresses[key] = a;
-				return a;
+				if (s.empty()) return no_set;
+				if (const auto it = set_ids.find(s); it != set_ids.end()) return it->second;
+				const auto id = sets.size();
+				set_ids[s] = id;
+				sets.push_back(std::move(s));
+				return id;
 			};
 			auto any_light = [&](const float* o, float size)
 			{
@@ -1831,8 +1825,8 @@ namespace zonetool::iw7::iwzmap
 						if (leaf_children)
 						{
 							GfxVoxelLeafNode leaf{};
-							leaf.lightListAddress = address(touching(o.data(), child));
 							leaves.push_back(leaf);
+							leaf_set.push_back(set_id(touching(o.data(), child)));
 						}
 						else
 						{
@@ -1875,6 +1869,42 @@ namespace zonetool::iw7::iwzmap
 				}
 			}
 
+			// which sets get a list: IWZ_VOXEL_SLACK=n forces the slack (0: every distinct set has its own list), else the smallest slack that fits
+			int forced_slack = -1;
+			if (const auto* v = std::getenv("IWZ_VOXEL_SLACK")) forced_slack = std::clamp(std::atoi(v), 0, static_cast<int>(voxel_lists::max_slack));
+			const auto plan = voxel_lists::choose(sets, forced_slack);
+			if (!plan.fits)
+				throw std::runtime_error("voxel light lists exceed 65535 entries: " + std::to_string(plan.entries_at_zero) + " with a list per distinct set (" + std::to_string(sets.size()) +
+					"), " + std::to_string(plan.entries) + " at slack " + std::to_string(plan.slack) + " (a leaf may name up to " + std::to_string(plan.slack) + " lights its box is outside of)");
+			std::vector<unsigned short> address_of(sets.size(), 0);
+			std::size_t kept = 0, extra_refs = 0, longest = 0;
+			for (std::size_t id = 0; id < sets.size(); id++)
+			{
+				if (plan.rep[id] != id) continue;
+				std::vector<unsigned short> spots, omnis;
+				for (const auto li : sets[id]) (cw->primaryLights[lights[li].slot].type == GFX_LIGHT_TYPE_SPOT ? spots : omnis).push_back(static_cast<unsigned short>(lights[li].slot));
+				std::sort(spots.begin(), spots.end());
+				std::sort(omnis.begin(), omnis.end());
+				if (spots.size() > voxel_lists::max_spots || omnis.size() > voxel_lists::max_omnis)
+					throw std::runtime_error("a voxel light list names " + std::to_string(spots.size()) + " spot and " + std::to_string(omnis.size()) + " omni lights: its header holds at most " +
+						std::to_string(voxel_lists::max_spots) + " and " + std::to_string(voxel_lists::max_omnis));
+				address_of[id] = static_cast<unsigned short>(arr.size());
+				arr.push_back(static_cast<unsigned short>((spots.size() << 7) | omnis.size()));
+				arr.insert(arr.end(), spots.begin(), spots.end());
+				arr.insert(arr.end(), omnis.begin(), omnis.end());
+				kept++;
+				longest = std::max(longest, sets[id].size());
+			}
+			for (std::size_t k = 1; k < leaves.size(); k++)
+			{
+				if (leaf_set[k] == no_set) { leaves[k].lightListAddress = 2; continue; }
+				const auto own = leaf_set[k], used = plan.rep[own];
+				leaves[k].lightListAddress = address_of[used];
+				extra_refs += sets[used].size() - sets[own].size();
+			}
+			ZONETOOL_INFO("iwzmap: voxel light lists: %zu distinct sets, %zu entries with a list each; slack %zu: %zu lists kept, %zu entries (limit 65535), longest list %zu lights, %zu leaf refs name a light the leaf is outside of",
+				sets.size(), plan.entries_at_zero, plan.slack, kept, arr.size(), longest, extra_refs);
+
 			t.voxelTreeHeader = h;
 			t.voxelTopDownViewNodeCount = static_cast<int>(columns.size());
 			t.voxelTopDownViewNodeArray = mem->allocate<GfxVoxelTopDownViewNode>(columns.size());
@@ -1894,7 +1924,7 @@ namespace zonetool::iw7::iwzmap
 			t.zoneBound = make_bounds(zmin, zmax);
 			for (auto v = 1; v < w->voxelTreeCount; v++) w->voxelTree[v] = t;
 			ZONETOOL_INFO("iwzmap: voxel light tree %dx%dx%d roots at %.0f %.0f %.0f: %zu internal nodes, %zu leaves, %zu light lists (%zu entries)",
-				dim[0], dim[1], dim[2], base[0], base[1], base[2], internal.size(), leaves.size(), addresses.size(), arr.size());
+				dim[0], dim[1], dim[2], base[0], base[1], base[2], internal.size(), leaves.size(), kept + 1, arr.size());
 
 			// verification: decode the generated tree with the same reader and check every listed light
 			std::uint64_t ok = 0, total = 0;
@@ -1909,7 +1939,7 @@ namespace zonetool::iw7::iwzmap
 					if (box_touches_sphere(o, size, l.origin, l.radius + 1.0f)) ok++;
 				}
 			});
-			ZONETOOL_INFO("iwzmap: voxel light tree check: %llu / %llu light refs inside the light sphere", ok, total);
+			ZONETOOL_INFO("iwzmap: voxel light tree check: %llu / %llu light refs inside the light sphere (the others are slack refs)", ok, total);
 		}
 
 		void build_gfx(GfxWorld* w, GfxWorldTransientZone* tz, const world_source& src, const std::vector<smodel_source>& smodels,
