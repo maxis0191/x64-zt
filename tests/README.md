@@ -38,4 +38,5 @@ own known files on success. On failure, the directory remains for diagnosis.
 
 The voxel light list target (`iwzmap_voxel_lists.hpp`, header only) checks the compiler's static light voxel lists: which distinct light sets need a list of
 their own when a leaf may name a few lights its box is outside of (`absorb`), the smallest slack that keeps the array under the u16 address limit (`choose`), and a
-fixture whose entry counts equal `studio/voxellights.py` of the Studio repository.
+fixture whose entry counts equal `studio/voxellights.py` of the Studio repository. The budget policy (`budget_slack`, `choose_budget`: a set held by n
+leaves takes up to budget / n extra lights, the compiler's default) has the same kind of fixture.

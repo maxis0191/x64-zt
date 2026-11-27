@@ -18,6 +18,12 @@
 // other list, which makes its own list unnecessary. `absorb` does it for every set that is a subset of a kept set with at
 // most `slack` extra lights; slack 0 absorbs nothing (the lists of before this change, byte for byte).
 // The same algorithm, with the same order and tie-breaks, is studio/voxellights.py (`studio check` predicts the count).
+//
+// How many extra lights a set may take is a choice per set (worker VX, 27 Nov 2026, docs/VOXEL-LIGHT-CAP.md of iw7-mod-components): a uniform slack
+// charges every leaf the same, though a set held by 40,000 leaves costs 40,000 extra evaluations for one saved list while a set held by 2 leaves costs 2.
+// The BUDGET policy gives a set of `n` leaves `slack = budget / n` extra lights (at most max_slack): the extra evaluations of one absorbed set stay
+// under `budget`, so the rare sets, which are most of the lists, are absorbed hard and the big ones stay exact. On the Arcade r17 lights (11,316 sets):
+// uniform slack 1 = 64,101 entries and 0.189 extra lights per light ref; budget 4 = 55,728 entries and 0.004; budget 16 = 28,346 entries and 0.014.
 
 #include <algorithm>
 #include <cstddef>
@@ -35,13 +41,13 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 	constexpr std::size_t max_omnis = 127;       // the list header holds the omni count in 7 bits
 	constexpr std::size_t max_spots = 511;       // and the spot count in the 9 bits above
 
-	// representative of every set: itself when its list is kept, else the kept set it is a subset of.
+	// representative of every set: itself when its list is kept, else the kept set it is a subset of with at most slack[i] extra lights.
 	// Order: size descending, then the sets themselves ascending; a kept set is the smallest candidate (the first of equals).
-	inline std::vector<std::size_t> absorb(const std::vector<light_set>& sets, std::size_t slack)
+	inline std::vector<std::size_t> absorb(const std::vector<light_set>& sets, const std::vector<std::size_t>& slack)
 	{
 		std::vector<std::size_t> rep(sets.size());
 		std::iota(rep.begin(), rep.end(), std::size_t{0});
-		if (!slack || sets.empty()) return rep;
+		if (sets.empty() || std::none_of(slack.begin(), slack.end(), [](std::size_t s) { return s != 0; })) return rep;
 
 		std::vector<std::size_t> order(sets.size());
 		std::iota(order.begin(), order.end(), std::size_t{0});
@@ -63,7 +69,7 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 			for (const auto b : kept_with[pivot])
 			{
 				const auto& bs = sets[b];
-				if (bs.size() - a.size() > slack) continue;
+				if (bs.size() - a.size() > slack[idx]) continue;
 				if (best != none && bs.size() >= sets[best].size()) continue;
 				if (std::includes(bs.begin(), bs.end(), a.begin(), a.end())) best = b;
 			}
@@ -71,6 +77,20 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 			for (const auto l : a) kept_with[l].push_back(idx);
 		}
 		return rep;
+	}
+
+	// the same slack for every set
+	inline std::vector<std::size_t> absorb(const std::vector<light_set>& sets, std::size_t slack)
+	{
+		return absorb(sets, std::vector<std::size_t>(sets.size(), slack));
+	}
+
+	// the slack of every set under a budget: a set held by `leaves[i]` leaves may take budget / leaves[i] extra lights, at most max_slack; budget 0 takes none
+	inline std::vector<std::size_t> budget_slack(const std::vector<std::size_t>& leaves, std::size_t budget)
+	{
+		std::vector<std::size_t> slack(leaves.size(), 0);
+		for (std::size_t i = 0; i < leaves.size(); i++) slack[i] = std::min(max_slack, budget / std::max<std::size_t>(leaves[i], 1));
+		return slack;
 	}
 
 	// entries of the light list array once only the kept sets have a list
@@ -83,7 +103,8 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 
 	struct plan
 	{
-		std::size_t slack = 0;
+		std::size_t slack = 0;   // uniform policy: the slack of every set; budget policy: the largest slack a set was given
+		std::size_t budget = 0;  // budget policy: the budget (0: not used)
 		std::size_t entries_at_zero = 0;
 		std::size_t entries = 0;
 		bool fits = false;
@@ -95,7 +116,7 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 	inline plan choose(const std::vector<light_set>& sets, int forced_slack)
 	{
 		plan p;
-		p.rep = absorb(sets, 0);
+		p.rep = absorb(sets, std::size_t{0});
 		p.entries_at_zero = p.entries = entries(sets, p.rep);
 		p.fits = p.entries <= entry_limit;
 		if (forced_slack == 0 || (forced_slack < 0 && p.fits)) return p;
@@ -108,6 +129,41 @@ namespace zonetool::iw7::iwzmap::voxel_lists
 			p.entries = entries(sets, p.rep);
 			p.fits = p.entries <= entry_limit;
 			if (p.fits) break;
+		}
+		return p;
+	}
+
+	// the budgets tried in turn: 1 2 3 4 6 8 12 16 24 32 ... (times 1.5 and times 2 alternately)
+	inline std::size_t next_budget(std::size_t b)
+	{
+		if (b < 3) return b + 1;
+		const auto power_of_two = (b & (b - 1)) == 0;
+		return power_of_two ? b + b / 2 : (b / 3) * 4;
+	}
+
+	// leaves[i] = the number of leaves that hold sets[i] (>= 1).
+	// forced_budget > 0: that budget only; 0: no absorbing; negative: the smallest budget whose lists fit (0 when they already do), up to the one that gives every set
+	// max_slack (which is the uniform slack max_slack for the sets of any size: nothing more can be absorbed).
+	inline plan choose_budget(const std::vector<light_set>& sets, const std::vector<std::size_t>& leaves, long long forced_budget)
+	{
+		plan p;
+		p.rep = absorb(sets, std::size_t{0});
+		p.entries_at_zero = p.entries = entries(sets, p.rep);
+		p.fits = p.entries <= entry_limit;
+		if (sets.empty() || forced_budget == 0 || (forced_budget < 0 && p.fits)) return p;
+		const auto widest = leaves.empty() ? std::size_t{1} : *std::max_element(leaves.begin(), leaves.end());
+		const auto ceiling = max_slack * widest;
+		auto b = forced_budget > 0 ? static_cast<std::size_t>(forced_budget) : std::size_t{1};
+		for (;;)
+		{
+			const auto slack = budget_slack(leaves, b);
+			p.budget = b;
+			p.slack = *std::max_element(slack.begin(), slack.end());
+			p.rep = absorb(sets, slack);
+			p.entries = entries(sets, p.rep);
+			p.fits = p.entries <= entry_limit;
+			if (p.fits || forced_budget > 0 || b >= ceiling) break;
+			b = next_budget(b);
 		}
 		return p;
 	}

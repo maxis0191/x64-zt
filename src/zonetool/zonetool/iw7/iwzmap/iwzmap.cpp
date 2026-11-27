@@ -1966,13 +1966,22 @@ namespace zonetool::iw7::iwzmap
 				}
 			}
 
-			// which sets get a list: IWZ_VOXEL_SLACK=n forces the slack (0: every distinct set has its own list), else the smallest slack that fits
+			// which sets get a list: IWZ_VOXEL_SLACK=n forces one slack for every set (0: every distinct set has its own list), IWZ_VOXEL_BUDGET=n forces the budget
+			// (voxel_lists.hpp: a set held by k leaves takes up to n / k extra lights), else the smallest budget that fits
+			std::vector<std::size_t> leaves_of(sets.size(), 0);
+			for (const auto id : leaf_set) if (id != no_set) leaves_of[id]++;
 			int forced_slack = -1;
+			long long forced_budget = -1;
 			if (const auto* v = std::getenv("IWZ_VOXEL_SLACK")) forced_slack = std::clamp(std::atoi(v), 0, static_cast<int>(voxel_lists::max_slack));
-			const auto plan = voxel_lists::choose(sets, forced_slack);
+			if (const auto* v = std::getenv("IWZ_VOXEL_BUDGET")) forced_budget = std::max(0ll, std::atoll(v));
+			const auto uniform = std::getenv("IWZ_VOXEL_SLACK") && !std::getenv("IWZ_VOXEL_BUDGET");
+			const auto plan = uniform ? voxel_lists::choose(sets, forced_slack) : voxel_lists::choose_budget(sets, leaves_of, forced_budget);
 			if (!plan.fits)
+			{
+				const auto policy = plan.budget ? "budget " + std::to_string(plan.budget) + " (slack up to " + std::to_string(plan.slack) + ")" : "slack " + std::to_string(plan.slack);
 				throw std::runtime_error("voxel light lists exceed 65535 entries: " + std::to_string(plan.entries_at_zero) + " with a list per distinct set (" + std::to_string(sets.size()) +
-					"), " + std::to_string(plan.entries) + " at slack " + std::to_string(plan.slack) + " (a leaf may name up to " + std::to_string(plan.slack) + " lights its box is outside of)");
+					"), " + std::to_string(plan.entries) + " at " + policy + " (a leaf may name up to " + std::to_string(plan.slack) + " lights its box is outside of)");
+			}
 			std::vector<unsigned short> address_of(sets.size(), 0);
 			std::size_t kept = 0, extra_refs = 0, longest = 0;
 			for (std::size_t id = 0; id < sets.size(); id++)
@@ -1999,8 +2008,8 @@ namespace zonetool::iw7::iwzmap
 				leaves[k].lightListAddress = address_of[used];
 				extra_refs += sets[used].size() - sets[own].size();
 			}
-			ZONETOOL_INFO("iwzmap: voxel light lists: %zu distinct sets, %zu entries with a list each; slack %zu: %zu lists kept, %zu entries (limit 65535), longest list %zu lights, %zu leaf refs name a light the leaf is outside of",
-				sets.size(), plan.entries_at_zero, plan.slack, kept, arr.size(), longest, extra_refs);
+			ZONETOOL_INFO("iwzmap: voxel light lists: %zu distinct sets, %zu entries with a list each; %s %zu (largest slack %zu): %zu lists kept, %zu entries (limit 65535), longest list %zu lights, %zu leaf refs name a light the leaf is outside of",
+				sets.size(), plan.entries_at_zero, plan.budget ? "budget" : "slack", plan.budget ? plan.budget : plan.slack, plan.slack, kept, arr.size(), longest, extra_refs);
 
 			t.voxelTreeHeader = h;
 			t.voxelTopDownViewNodeCount = static_cast<int>(columns.size());
