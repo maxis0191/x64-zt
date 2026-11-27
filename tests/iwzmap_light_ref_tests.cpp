@@ -47,8 +47,7 @@ int main()
 	catch (const std::exception& e)
 	{
 		std::fputs(e.what(), stderr);
-		std::fputc('
-', stderr);
+		std::fputc('\n', stderr);
 		return 1;
 	}
 	return 0;
