@@ -27,6 +27,7 @@
 
 #include <utils/io.hpp>
 
+#include "iwzmap_light_ref.hpp"
 #include "iwzmap_volumes.hpp"
 
 // IW7 map compiler ("iwzmap").
@@ -1636,20 +1637,36 @@ namespace zonetool::iw7::iwzmap
 			if (w->shadowGeomOptimized && !std::getenv("IWZ_KEEP_TEMPLATE_SHADOWGEOM"))
 				for (auto k = 0u; k < w->primaryLightCount; k++) w->shadowGeomOptimized[k] = {};
 
-			// reference culling mesh: an unused template omni slot's sphere mesh (32 vertices around the light at
-			// 1.2-1.4 x its radius on cp_zmb), scaled onto every generated light. IWZ_TEMPLATE_LIGHT_SHAPES=1 keeps the
-			// old behaviour (each slot's own template shapes moved and scaled), for A/B frames.
+			// reference culling mesh: a template omni slot's sphere mesh (32 vertices around the light at 1.2-1.4 x its
+			// radius on cp_zmb), scaled onto every generated light. IWZ_TEMPLATE_LIGHT_SHAPES=1 keeps the old behaviour
+			// (each slot's own template shapes moved and scaled), for A/B frames.
+			// The reference is read from the template as it was BEFORE the generated lights overwrote their slots: a slot
+			// that a generated light uses still holds its template mesh here (the loop below replaces it) and `before`
+			// holds its template light. An unused slot is preferred (the choice of earlier builds); a used one is the
+			// fallback. Searching unused slots only broke past 177 named lights (cp_zmb: the scriptable range grows
+			// downwards over every 32-vertex omni slot, from about slot 861, inferred; none was left, the reference was lost and every
+			// light kept its own template shape moved onto it: black stair-stepped patches, FE66).
 			std::set<unsigned> used;
-			for (const auto& l : lights) used.insert(l.slot);
-			auto ref = ~0u;
-			for (auto k = 0u; w->frustumLights && k < w->primaryLightCount && ref == ~0u; k++)
+			std::map<unsigned, const ComPrimaryLight*> template_light;
+			for (auto li = 0u; li < lights.size(); li++) { used.insert(lights[li].slot); template_light[lights[li].slot] = &before[li]; }
+			const auto template_of = [&](unsigned k) -> const ComPrimaryLight& { const auto it = template_light.find(k); return it != template_light.end() ? *it->second : cw->primaryLights[k]; };
+			std::vector<light_ref::candidate> candidates(w->frustumLights ? w->primaryLightCount : 0);
+			for (auto k = 0u; k < candidates.size(); k++)
 			{
 				const auto& f = w->frustumLights[k];
-				if (used.count(k) || cw->primaryLights[k].type != GFX_LIGHT_TYPE_OMNI || !(cw->primaryLights[k].radius > 0.0f)) continue;
-				if (f.vertexCount != 32 || !f.vertices || !f.indices || !f.indexCount) continue;
-				if (w->lightViewFrustums && w->lightViewFrustums[k].planeCount) continue;
-				ref = k;
+				const auto& t = template_of(k);
+				auto& c = candidates[k];
+				c.omni = t.type == GFX_LIGHT_TYPE_OMNI;
+				c.radius = t.radius;
+				c.vertex_count = f.vertexCount;
+				c.index_count = f.indexCount;
+				c.has_data = f.vertices && f.indices;
+				c.plane_count = w->lightViewFrustums ? w->lightViewFrustums[k].planeCount : 0;
+				c.used = used.count(k) != 0;
 			}
+			const auto ref = light_ref::pick(candidates);
+			if (ref == ~0u && w->frustumLights && !std::getenv("IWZ_TEMPLATE_LIGHT_SHAPES"))
+				throw std::runtime_error("no template omni light slot has a 32 vertex culling sphere: the generated lights cannot get their own culling shapes (IWZ_TEMPLATE_LIGHT_SHAPES=1 keeps the template's moved shapes, which cut lit areas along their outline)");
 			const auto own_shapes = ref != ~0u && !std::getenv("IWZ_TEMPLATE_LIGHT_SHAPES");
 			std::vector<char> ref_vertices;
 			std::vector<unsigned short> ref_indices;
@@ -1659,11 +1676,11 @@ namespace zonetool::iw7::iwzmap
 				const auto& f = w->frustumLights[ref];
 				ref_vertices.assign(f.vertices, f.vertices + 32ull * f.vertexCount);
 				ref_indices.assign(f.indices, f.indices + f.indexCount);
-				for (auto a = 0; a < 3; a++) ref_origin[a] = cw->primaryLights[ref].origin[a];
-				ref_radius = cw->primaryLights[ref].radius;
+				for (auto a = 0; a < 3; a++) ref_origin[a] = template_of(ref).origin[a];
+				ref_radius = template_of(ref).radius;
 			}
-			ZONETOOL_INFO("iwzmap: light culling shapes: %s (reference omni slot %d, radius %.0f)", own_shapes ? "own" : "template (moved)",
-				ref == ~0u ? -1 : static_cast<int>(ref), ref_radius);
+			ZONETOOL_INFO("iwzmap: light culling shapes: %s (reference omni slot %d%s, radius %.0f)", own_shapes ? "own" : "template (moved)",
+				ref == ~0u ? -1 : static_cast<int>(ref), ref != ~0u && used.count(ref) ? " used by a generated light" : "", ref_radius);
 			for (auto li = 0u; li < lights.size(); li++)
 			{
 				const auto& l = lights[li];
@@ -1686,21 +1703,22 @@ namespace zonetool::iw7::iwzmap
 					// the light's own culling shapes (the template's are clipped to the template's rooms and, for a
 					// spot slot, are a cone: an omni light or a wider spot placed there is cut along their outline)
 					auto& f = w->frustumLights[k];
-					const auto& rf = w->frustumLights[ref];
+					// from the copies taken before the loop: the reference slot may itself be a generated light's slot and replaced
+					const auto ref_vertex_count = static_cast<unsigned int>(ref_vertices.size() / 32), ref_index_count = static_cast<unsigned int>(ref_indices.size());
 					const auto s = n.radius / ref_radius;
-					auto* verts = mem->allocate<char>(32ull * rf.vertexCount);
-					std::memcpy(verts, ref_vertices.data(), 32ull * rf.vertexCount);
-					for (auto v = 0u; v < rf.vertexCount; v++)
+					auto* verts = mem->allocate<char>(32ull * ref_vertex_count);
+					std::memcpy(verts, ref_vertices.data(), 32ull * ref_vertex_count);
+					for (auto v = 0u; v < ref_vertex_count; v++)
 					{
 						auto* p = reinterpret_cast<float*>(verts + 32ull * v);
 						for (auto a = 0; a < 3; a++) p[a] = n.origin[a] + s * (p[a] - ref_origin[a]);
 					}
-					auto* idx = mem->allocate<unsigned short>(rf.indexCount);
-					std::memcpy(idx, ref_indices.data(), 2ull * rf.indexCount);
-					f.vertices = verts; f.vertexCount = rf.vertexCount;
-					f.indices = idx; f.indexCount = rf.indexCount;
+					auto* idx = mem->allocate<unsigned short>(ref_index_count);
+					std::memcpy(idx, ref_indices.data(), 2ull * ref_index_count);
+					f.vertices = verts; f.vertexCount = ref_vertex_count;
+					f.indices = idx; f.indexCount = ref_index_count;
 					f.indexBuffer = nullptr; f.vertexBuffer = nullptr;
-					moved_vertices += rf.vertexCount;
+					moved_vertices += ref_vertex_count;
 					if (w->lightViewFrustums)
 					{
 						auto& v = w->lightViewFrustums[k];

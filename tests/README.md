@@ -11,6 +11,8 @@ msbuild tests/iwzmap_smodel_rules_tests.vcxproj /m:1 /nr:false /p:Configuration=
 ./build/tests/iwzmap_smodel_rules_tests.exe
 msbuild tests/iwzmap_voxel_lists_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
 ./build/tests/iwzmap_voxel_lists_tests.exe
+msbuild tests/iwzmap_light_ref_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
+./build/tests/iwzmap_light_ref_tests.exe
 ```
 
 The filesystem target compiles the production `filesystem.cpp` with a minimal
