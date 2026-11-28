@@ -1,6 +1,7 @@
 #include <std_include.hpp>
 #include "zonetool/iw7/zonetool.hpp"
 #include "iwzmap.hpp"
+#include "iwzmap_draw_classes.hpp"
 #include "iwzmap_lightmap.hpp"
 #include "iwzmap_smodel_rules.hpp"
 #include "iwzmap_voxel_lists.hpp"
@@ -566,6 +567,117 @@ namespace zonetool::iw7::iwzmap
 			auto* asset = mem->allocate<T>();
 			asset->name = mem->duplicate_string(name);
 			return asset;
+		}
+
+		// Draw classes (R2-PARITY section 14): `draw_classes.txt` next to world.bin lists the materials whose sort key is not opaque; the template world's own
+		// sortKey bands say which dpvs range such a surface belongs to. The surfaces are grouped by class right after the world is read, so every later
+		// consumer (tome ids, light lists, the aabb leaf) sees the final surface index.
+		struct draw_plan
+		{
+			std::vector<int> kinds;                                   // per surface, in the final order
+			unsigned int count[draw_classes::kind_count]{};
+			std::unordered_map<std::string, unsigned int> sort_keys;   // the file: material -> sort key
+			draw_classes::bands bands;
+		};
+
+		draw_plan apply_draw_classes(const GfxWorld* w, world_source& src, const std::string& source_dir, bool slot_mode)
+		{
+			draw_plan plan;
+			plan.kinds.assign(src.surfaces.size(), draw_classes::opaque);
+			plan.count[draw_classes::opaque] = static_cast<unsigned int>(src.surfaces.size());
+			std::string text;
+			if (!utils::io::read_file(source_dir + "\\draw_classes.txt", &text)) return plan;
+			plan.sort_keys = draw_classes::parse(text);
+			if (plan.sort_keys.empty()) return plan;
+
+			auto& b = plan.bands;
+			b.begin[draw_classes::opaque] = w->sortKeyOpaqueBegin; b.end[draw_classes::opaque] = w->sortKeyOpaqueEnd;
+			b.begin[draw_classes::decal] = w->sortKeyDecalBegin; b.end[draw_classes::decal] = w->sortKeyDecalEnd;
+			b.begin[draw_classes::trans] = w->sortKeyTransBegin; b.end[draw_classes::trans] = w->sortKeyTransEnd;
+			b.begin[draw_classes::emissive] = w->sortKeyEmissiveBegin; b.end[draw_classes::emissive] = w->sortKeyEmissiveEnd;
+			ZONETOOL_INFO("iwzmap: draw classes: template sort key bands opaque %u..%u decal %u..%u trans %u..%u emissive %u..%u; %zu materials listed",
+				b.begin[0], b.end[0], b.begin[1], b.end[1], b.begin[2], b.end[2], b.begin[3], b.end[3], plan.sort_keys.size());
+			if (slot_mode)
+			{
+				ZONETOOL_WARNING("iwzmap: draw classes: draw_classes.txt is ignored in slot mode (generated surfaces sit in template slots)");
+				return plan;
+			}
+
+			std::vector<int> material_kind(src.materials.size(), draw_classes::opaque);
+			for (auto m = 0u; m < src.materials.size(); m++)
+			{
+				const auto it = plan.sort_keys.find(src.materials[m]);
+				if (it != plan.sort_keys.end()) material_kind[m] = draw_classes::classify(it->second, b);
+			}
+			std::vector<int> kinds(src.surfaces.size());
+			for (auto i = 0u; i < src.surfaces.size(); i++) kinds[i] = material_kind[src.surfaces[i].material];
+			const auto part = draw_classes::partition(kinds);
+			for (auto k = 0; k < draw_classes::kind_count; k++) plan.count[k] = part.count[k];
+			if (!part.identity)
+			{
+				std::vector<src_surface> sorted;
+				sorted.reserve(src.surfaces.size());
+				for (const auto old : part.order) sorted.push_back(src.surfaces[old]);
+				src.surfaces = std::move(sorted);
+				plan.kinds.clear();
+				for (const auto old : part.order) plan.kinds.push_back(kinds[old]);
+			}
+			else
+			{
+				plan.kinds = kinds;
+			}
+			ZONETOOL_INFO("iwzmap: draw classes: %u opaque, %u decal, %u trans, %u emissive surfaces%s", plan.count[0], plan.count[1], plan.count[2], plan.count[3],
+				part.identity ? " (surface order unchanged)" : " (grouped by class)");
+			return plan;
+		}
+
+		// the template's dpvs range of a class: [begin, end) of surface indices
+		void template_range(const GfxWorld* w, int kind, unsigned int* begin, unsigned int* end)
+		{
+			switch (kind)
+			{
+			case draw_classes::decal: *begin = w->dpvs.litDecalSurfsBegin; *end = w->dpvs.litDecalSurfsEnd; break;
+			case draw_classes::trans: *begin = w->dpvs.litTransSurfsBegin; *end = w->dpvs.litTransSurfsEnd; break;
+			case draw_classes::emissive: *begin = w->dpvs.emissiveSurfsBegin; *end = w->dpvs.emissiveSurfsEnd; break;
+			default: *begin = w->dpvs.litOpaqueSurfsBegin; *end = w->dpvs.litOpaqueSurfsEnd; break;
+			}
+		}
+
+		// the template surface that stands for a class: the first one of the most common (lightmap, flags, sort key, unknown bytes) tuple of the
+		// class's range. -1 when the range is empty. Logs the range and its five most common tuples.
+		int class_donor(const GfxWorld* w, int kind)
+		{
+			unsigned int begin = 0, end = 0;
+			template_range(w, kind, &begin, &end);
+			if (end > w->surfaceCount) end = w->surfaceCount;
+			if (end <= begin)
+			{
+				ZONETOOL_INFO("iwzmap: draw classes: template %s range is empty", draw_classes::kind_name(kind));
+				return -1;
+			}
+			struct tuple_count { unsigned int count = 0; unsigned int first = 0; };
+			std::map<std::array<unsigned int, 8>, tuple_count> hist;
+			for (auto i = begin; i < end; i++)
+			{
+				const auto& s = w->dpvs.surfaces[i];
+				const std::array<unsigned int, 8> key = {s.lightmapIndex, s.flags, s.sortKey, s.unk1, s.unk2, s.unk3, s.unk4, s.transientZone};
+				auto& t = hist[key];
+				if (!t.count) t.first = i;
+				t.count++;
+			}
+			std::vector<std::pair<unsigned int, std::array<unsigned int, 8>>> order;
+			for (const auto& [key, t] : hist) order.emplace_back(t.count, key);
+			std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			ZONETOOL_INFO("iwzmap: draw classes: template %s range %u..%u (%u surfaces, %zu distinct tuples)", draw_classes::kind_name(kind), begin, end, end - begin, hist.size());
+			for (auto n = 0u; n < order.size() && n < 5; n++)
+			{
+				const auto& k = order[n].second;
+				const auto first = hist[k].first;
+				const auto& m = w->dpvs.surfaces[first].material;
+				ZONETOOL_INFO("iwzmap: draw classes:   %u x lm %u flags %02x sort %u unk %u %u %u %u tz %u, first surface %u (%s)", order[n].first, k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7],
+					first, m && m->name ? m->name : "-");
+			}
+			return static_cast<int>(hist[order.front().second].first);
 		}
 
 		void log_template(const GfxWorld* w)
@@ -2057,7 +2169,7 @@ namespace zonetool::iw7::iwzmap
 			ZONETOOL_INFO("iwzmap: voxel light tree check: %llu / %llu light refs inside the light sphere (the others are slack refs)", ok, total);
 		}
 
-		void build_gfx(GfxWorld* w, GfxWorldTransientZone* tz, const world_source& src, const std::vector<smodel_source>& smodels,
+		void build_gfx(GfxWorld* w, GfxWorldTransientZone* tz, const world_source& src, const draw_plan& plan, const std::vector<smodel_source>& smodels,
 			const std::vector<unsigned int>& light_slots, const std::string& map, const std::string& bsp, zone_memory* mem)
 		{
 			log_template(w);
@@ -2102,6 +2214,30 @@ namespace zonetool::iw7::iwzmap
 				}
 			}
 			const auto fallback = w->dpvs.litOpaqueSurfsBegin;
+			// draw classes: the template surface that stands for each non opaque class (flags, sort key and unknown bytes of the stock decal / trans / emissive
+			// surfaces), and a check of the sort key mapping on the materials the template also uses
+			int donor[draw_classes::kind_count] = {-1, -1, -1, -1};
+			if (plan.count[draw_classes::decal] + plan.count[draw_classes::trans] + plan.count[draw_classes::emissive])
+			{
+				for (auto k = static_cast<int>(draw_classes::decal); k < draw_classes::kind_count; k++)
+				{
+					if (plan.count[k]) donor[k] = class_donor(w, k);
+				}
+				unsigned int agree = 0, differ = 0;
+				for (const auto& [name, key] : plan.sort_keys)
+				{
+					const auto it = by_material.find(name);
+					if (it == by_material.end()) continue;
+					unsigned int tb[draw_classes::kind_count], te[draw_classes::kind_count];
+					for (auto k = 0; k < draw_classes::kind_count; k++) template_range(w, k, &tb[k], &te[k]);
+					const auto stock = draw_classes::template_kind(it->second, tb, te);
+					const auto mine = draw_classes::classify(key, plan.bands);
+					if (stock == mine) { agree++; continue; }
+					if (++differ <= 8) ZONETOOL_WARNING("iwzmap: draw classes: %s has sort key %u (%s) but the template surface %u of it is in the %s range", name.data(), key,
+						draw_classes::kind_name(mine), it->second, draw_classes::kind_name(stock));
+				}
+				ZONETOOL_INFO("iwzmap: draw classes: %u materials the template also uses: %u in the range their sort key says, %u not", agree + differ, agree, differ);
+			}
 			for (auto i : {0u, 1u, 2u, 100u, 1000u})
 			{
 				if (i < w->surfaceCount) ZONETOOL_INFO("template drawsurf %u: objectId %u packed %016llx %016llx", i,
@@ -2190,9 +2326,15 @@ namespace zonetool::iw7::iwzmap
 				const auto i = slot_mode ? slots[k] : tpl_count + k;
 				const auto& s = src.surfaces[k];
 				const auto& mat_name = src.materials[s.material];
-				const auto tpl = by_material.contains(mat_name) ? by_material[mat_name] : fallback;
+				const auto kind = slot_mode ? static_cast<int>(draw_classes::opaque) : plan.kinds[k];
+				const auto own_template = by_material.contains(mat_name);
+				auto tpl = own_template ? by_material[mat_name] : fallback;
+				const auto donated = !own_template && kind != draw_classes::opaque && donor[kind] >= 0;
+				if (donated) tpl = static_cast<unsigned int>(donor[kind]);
 				surfaces[i] = w->dpvs.surfaces[tpl];
 				draw_surfs[i] = w->dpvs.surfaceMaterials[tpl];
+				// a class donor lends its flags, sort key and unknown bytes; the lightmap is the generated world's own atlas (the opaque default's index)
+				if (donated) surfaces[i].lightmapIndex = w->dpvs.surfaces[fallback].lightmapIndex;
 				surfaces[i].material = materials[s.material];
 				surfaces[i].tris.vertexLayerData = world_layers::vertex_layer_data(s, 0);
 				surfaces[i].tris.firstVertex = s.first_vertex;
@@ -2231,11 +2373,20 @@ namespace zonetool::iw7::iwzmap
 					for (const auto slot : slots) { w->dpvs.sortedSurfIndex[pos++] = slot; used[slot] = true; }
 					for (auto i = 0u; i < count; i++) if (!used[i]) w->dpvs.sortedSurfIndex[pos++] = i;
 				}
-				w->dpvs.litOpaqueSurfsBegin = 0;
-				w->dpvs.litOpaqueSurfsEnd = count;
-				w->dpvs.litDecalSurfsBegin = w->dpvs.litDecalSurfsEnd = count;
-				w->dpvs.litTransSurfsBegin = w->dpvs.litTransSurfsEnd = count;
-				w->dpvs.emissiveSurfsBegin = w->dpvs.emissiveSurfsEnd = count;
+				// opaque (the kept template surfaces and the generated opaque ones), then decal, trans and emissive: with no class listed this is 0..count and three empty ranges at count
+				const auto ranges = draw_classes::make_ranges(tpl_count, plan.count);
+				w->dpvs.litOpaqueSurfsBegin = ranges.begin[draw_classes::opaque];
+				w->dpvs.litOpaqueSurfsEnd = ranges.end[draw_classes::opaque];
+				w->dpvs.litDecalSurfsBegin = ranges.begin[draw_classes::decal];
+				w->dpvs.litDecalSurfsEnd = ranges.end[draw_classes::decal];
+				w->dpvs.litTransSurfsBegin = ranges.begin[draw_classes::trans];
+				w->dpvs.litTransSurfsEnd = ranges.end[draw_classes::trans];
+				w->dpvs.emissiveSurfsBegin = ranges.begin[draw_classes::emissive];
+				w->dpvs.emissiveSurfsEnd = ranges.end[draw_classes::emissive];
+				if (ranges.end[draw_classes::emissive] != count) throw std::runtime_error("draw classes: the dpvs ranges do not cover the surfaces");
+				if (plan.count[draw_classes::decal] + plan.count[draw_classes::trans] + plan.count[draw_classes::emissive])
+					ZONETOOL_INFO("iwzmap: draw classes: dpvs ranges opaque %u..%u decal %u..%u trans %u..%u emissive %u..%u", ranges.begin[0], ranges.end[0], ranges.begin[1], ranges.end[1],
+						ranges.begin[2], ranges.end[2], ranges.begin[3], ranges.end[3]);
 			}
 			w->dpvs.surfaceVisDataCount = count;
 			w->dpvs.surfaceCastsSunShadow = mem->allocate<unsigned int>(count);
@@ -2992,7 +3143,7 @@ namespace zonetool::iw7::iwzmap
 		{
 			const auto tpl_bsp = "maps/cp/" + template_map + ".d3dbsp";
 			const auto bsp = "maps/cp/" + map + ".d3dbsp";
-			const auto src = read_world(source + "\\world.bin");
+			auto src = read_world(source + "\\world.bin");
 
 			std::string hkx, graph, ents, triggers, relocations, light_ents;
 			if (!utils::io::read_file(source + "\\colmap.hkx", &hkx)) throw std::runtime_error("missing colmap.hkx");
@@ -3116,7 +3267,8 @@ namespace zonetool::iw7::iwzmap
 				for (const auto& l : lights) before.push_back(cw->primaryLights[l.slot]);
 				build_com_lights(cw, lights);
 				light_ents = light_ents_text(cw, lights);
-				build_gfx(w, tz, src, smodels, slots, map, bsp, mem.get());
+				const auto plan = apply_draw_classes(w, src, source, std::getenv("IWZ_KEEP_UMBRA") != nullptr && std::getenv("IWZ_SLOT_SURFACES") != nullptr);
+				build_gfx(w, tz, src, plan, smodels, slots, map, bsp, mem.get());
 				build_gfx_lights(w, before, cw, lights, src, mem.get());
 				voxel_layout lay;
 				if (const auto* v = std::getenv("IWZ_VOXEL_LAYOUT")) std::sscanf(v, "%d,%d", &lay.column_x_major, &lay.perm);
