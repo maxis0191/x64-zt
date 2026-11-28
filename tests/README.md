@@ -13,6 +13,8 @@ msbuild tests/iwzmap_voxel_lists_tests.vcxproj /m:1 /nr:false /p:Configuration=R
 ./build/tests/iwzmap_voxel_lists_tests.exe
 msbuild tests/iwzmap_light_ref_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
 ./build/tests/iwzmap_light_ref_tests.exe
+msbuild tests/iwzmap_world_layers_tests.vcxproj /m:1 /nr:false /p:Configuration=Release /p:Platform=x64
+./build/tests/iwzmap_world_layers_tests.exe
 ```
 
 The filesystem target compiles the production `filesystem.cpp` with a minimal
@@ -40,3 +42,7 @@ The voxel light list target (`iwzmap_voxel_lists.hpp`, header only) checks the c
 their own when a leaf may name a few lights its box is outside of (`absorb`), the smallest slack that keeps the array under the u16 address limit (`choose`), and a
 fixture whose entry counts equal `studio/voxellights.py` of the Studio repository. The budget policy (`budget_slack`, `choose_budget`: a set held by n
 leaves takes up to budget / n extra lights, the compiler's default) has the same kind of fixture.
+
+The world layer target (`iwzmap_world_layers.hpp`, header only) checks the world.bin version 2 surface record (44 byte version 1 record plus layer offset and stride, read field by field),
+the validation of a layered surface's record against the layer blob (inside, 4 aligned, no 32 bit wrap), the zone's layer stream (the blob, padded with zeros up to the zeroed 16 bytes a vertex
+of a world without layers, which is what version 1 files still get), the `vertexLayerData` of a layered and of a plain surface, and the one log line of a build.

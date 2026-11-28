@@ -4,6 +4,7 @@
 #include "iwzmap_lightmap.hpp"
 #include "iwzmap_smodel_rules.hpp"
 #include "iwzmap_voxel_lists.hpp"
+#include "iwzmap_world_layers.hpp"
 
 #include <array>
 #include <bit>
@@ -241,16 +242,8 @@ namespace zonetool::iw7::iwzmap
 			return t.data();
 		}
 
-		struct src_surface
-		{
-			std::uint32_t material;
-			std::uint32_t first_vertex;
-			std::uint32_t vertex_count;
-			std::uint32_t base_index;
-			std::uint32_t tri_count;
-			float mins[3];
-			float maxs[3];
-		};
+		// world.bin surface record (version 2 adds layer_offset and layer_stride; iwzmap_world_layers.hpp)
+		using src_surface = world_layers::surface;
 
 		struct world_source
 		{
@@ -258,6 +251,7 @@ namespace zonetool::iw7::iwzmap
 			std::vector<GfxWorldVertex> vertices;
 			std::vector<std::uint16_t> indices;
 			std::vector<src_surface> surfaces;
+			std::vector<std::uint8_t> layer;     // version 2: the layer stream blob of the layered surfaces
 			float mins[3]{};
 			float maxs[3]{};
 		};
@@ -521,7 +515,8 @@ namespace zonetool::iw7::iwzmap
 
 			reader r(data);
 			if (r.get<std::uint32_t>() != 0x575A5749) throw std::runtime_error("world.bin: bad magic");
-			if (r.get<std::uint32_t>() != 1) throw std::runtime_error("world.bin: unsupported version");
+			const auto version = r.get<std::uint32_t>();
+			if (version != world_layers::version_plain && version != world_layers::version_layers) throw std::runtime_error("world.bin: unsupported version");
 
 			world_source w;
 			w.materials.resize(r.get<std::uint32_t>());
@@ -534,7 +529,21 @@ namespace zonetool::iw7::iwzmap
 			r.get_bytes(w.indices.data(), w.indices.size() * sizeof(std::uint16_t));
 
 			w.surfaces.resize(r.get<std::uint32_t>());
-			r.get_bytes(w.surfaces.data(), w.surfaces.size() * sizeof(src_surface));
+			{
+				const auto record = world_layers::surface_bytes(version);
+				std::vector<unsigned char> raw(record);
+				for (auto& surf : w.surfaces)
+				{
+					r.get_bytes(raw.data(), record);
+					surf = world_layers::decode_surface(raw.data(), version);
+				}
+			}
+			if (version == world_layers::version_layers)
+			{
+				w.layer.resize(r.get<std::uint32_t>());
+				r.get_bytes(w.layer.data(), w.layer.size());
+			}
+			world_layers::validate(w.surfaces, w.layer.size());
 
 			r.get_bytes(w.mins, sizeof(w.mins));
 			r.get_bytes(w.maxs, sizeof(w.maxs));
@@ -2185,7 +2194,7 @@ namespace zonetool::iw7::iwzmap
 				surfaces[i] = w->dpvs.surfaces[tpl];
 				draw_surfs[i] = w->dpvs.surfaceMaterials[tpl];
 				surfaces[i].material = materials[s.material];
-				surfaces[i].tris.vertexLayerData = 0;
+				surfaces[i].tris.vertexLayerData = world_layers::vertex_layer_data(s, 0);
 				surfaces[i].tris.firstVertex = s.first_vertex;
 				surfaces[i].tris.vertexCount = static_cast<unsigned short>(s.vertex_count);
 				surfaces[i].tris.triCount = static_cast<unsigned short>(s.tri_count);
@@ -2423,9 +2432,14 @@ namespace zonetool::iw7::iwzmap
 			tz->vertexCount = static_cast<unsigned int>(src.vertices.size());
 			tz->vd.vertices = mem->allocate<GfxWorldVertex>(src.vertices.size());
 			std::memcpy(tz->vd.vertices, src.vertices.data(), src.vertices.size() * sizeof(GfxWorldVertex));
-			// a non-empty (zeroed) vertex layer stream: the renderer creates a buffer from it
-			tz->vertexLayerDataSize = static_cast<unsigned int>(src.vertices.size() * 16);
-			tz->vld.data = mem->allocate<unsigned char>(tz->vertexLayerDataSize);
+			// the vertex layer stream: the layered surfaces' blob (world.bin version 2), then zeros up to a non-empty stream (the renderer creates a buffer from it)
+			{
+				const auto stream = world_layers::stream(src.layer, src.vertices.size());
+				tz->vertexLayerDataSize = static_cast<unsigned int>(stream.size());
+				tz->vld.data = mem->allocate<unsigned char>(tz->vertexLayerDataSize);
+				std::memcpy(tz->vld.data, stream.data(), stream.size());
+				ZONETOOL_INFO("%s", world_layers::summary_line(world_layers::summarize(src.surfaces)).data());
+			}
 			// slot mode keeps the template aabb trees (Umbra returns their nodes)
 			if (!slot_mode)
 			{
@@ -3056,6 +3070,17 @@ namespace zonetool::iw7::iwzmap
 					std::memcpy(idx + ti, src.indices.data(), src.indices.size() * sizeof(unsigned short));
 					w->draw.indices = idx;
 					w->draw.indexCount = ti + static_cast<unsigned int>(src.indices.size());
+					// world.bin version 2: the layer blob is appended to the stock layer stream; layered surfaces point into it
+					const auto layer_base = (tz->vertexLayerDataSize + 3u) & ~3u;
+					if (!src.layer.empty())
+					{
+						auto* vld = mem->allocate<unsigned char>(layer_base + src.layer.size());
+						if (tz->vld.data && tz->vertexLayerDataSize) std::memcpy(vld, tz->vld.data, tz->vertexLayerDataSize);
+						std::memcpy(vld + layer_base, src.layer.data(), src.layer.size());
+						tz->vld.data = vld;
+						tz->vertexLayerDataSize = layer_base + static_cast<unsigned int>(src.layer.size());
+						ZONETOOL_INFO("%s", world_layers::summary_line(world_layers::summarize(src.surfaces)).data());
+					}
 					std::vector<std::pair<float, unsigned int>> cand;
 					for (auto i = w->dpvs.litOpaqueSurfsBegin; i < w->dpvs.litOpaqueSurfsEnd; i++)
 					{
@@ -3076,6 +3101,7 @@ namespace zonetool::iw7::iwzmap
 						surf.tris.vertexCount = static_cast<unsigned short>(g.vertex_count);
 						surf.tris.triCount = static_cast<unsigned short>(g.tri_count);
 						surf.tris.baseIndex = ti + g.base_index;
+						if (g.layer_stride) surf.tris.vertexLayerData = world_layers::vertex_layer_data(g, layer_base);
 						ZONETOOL_INFO("slot %u had lightmap %u flags %02x", i, surf.lightmapIndex, surf.flags);
 						surf.lightmapIndex = 0;
 						ZONETOOL_INFO("injected generated surface %u into template slot %u (%s)", k, i, src.materials[g.material].data());
